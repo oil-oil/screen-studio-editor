@@ -155,23 +155,36 @@ Then follow the **Subtitle workflow** below with `/tmp/transcript.json` as the t
 
 ## Subtitle workflow
 
-### 1. Analyze video for technical terminology
+### 1. Semantic review — correct transcript.json
 
-Accurate subtitles require knowing the correct spelling of technical terms (e.g. `GitHub` not `github`, `React` not `react`). Extract keyframes from the video and analyze them directly — this is fast (~15s), free, and accurate for version numbers and exact filenames.
+Read the full transcript text first. Look for words that are **semantically inconsistent with the surrounding context** — Whisper mishears phonetically similar words. For every suspicious word, classify it:
+
+**High-confidence corrections** (fix immediately, no frames needed):
+- Clear phonetic substitutions with obvious right answer given context (`Scream Studio` → `Screen Studio`, `cloud call` → `Claude Code`, `Nordic.js` → `Node.js`)
+- Wrong capitalization of well-known proper nouns (`minimax` → `MiniMax`, `github` → `GitHub`)
+- Nonsense words where the correct word is unambiguous from context
+
+**Low-confidence items** (flag for visual verification):
+- English proper nouns you don't recognize — a product name, tool, or brand that appeared on screen but you can't confidently spell or capitalize
+- Commands or filenames that seem partially garbled
+- Version numbers or org names (e.g. `oyo-oyo/something` — is this `oil-oil`? `oiloil`?)
+
+Apply high-confidence fixes immediately. Then decide:
+
+- **No low-confidence items** → skip frame extraction entirely, proceed to preview editor
+- **Low-confidence items exist** → extract targeted frames around those timestamps only:
 
 ```bash
-mkdir -p /tmp/frames && ffmpeg -i "/path/to/exported.mp4" -vf "fps=1/30" /tmp/frames/frame_%04d.jpg -y
+# Extract a few frames near the uncertain segment (e.g. segment at ~42s)
+mkdir -p /tmp/frames
+ffmpeg -i "/path/to/video.mp4" -ss 30 -t 30 -vf "fps=1/5" /tmp/frames/frame_%04d.jpg -y
 ```
 
-This captures one frame every 30 seconds. Then use the `Read` tool to view the frames and list all technical terms, product names, company names, filenames, and tool names visible on screen — pay attention to exact capitalization and version numbers.
+Use the `Read` tool to view those frames, identify the correct term, then apply the fix.
 
-### 2. Correct transcript.json
+**Full-video frame extraction** (every 30s) is only warranted for dense screen-recording demos where many unknown technical terms appear throughout. For talking-head or pure voiceover videos, it wastes time and adds no value — skip it.
 
-Edit the `"text"` fields in `transcript.json` using find-replace. The subtitle script reads `text` fields directly, so corrections apply immediately on the next burn — no need to touch word-level tokens or the .ass file.
-
-**Step 2a — Visual corrections**: Apply the technical terms identified from frames (`react` → `React`, `github` → `GitHub`, `api` → `API`, etc.).
-
-**Step 2b — Semantic review**: After visual corrections, read the full transcript text and look for words that are **semantically inconsistent with the surrounding context**. Whisper mishears phonetically similar words — a word that makes no sense in context is likely a transcription error, not the speaker's actual word. Re-read every segment that contains an English proper noun and ask: "does this word make sense here, given the topic?" Fix what doesn't fit. Do not rely only on what appeared on screen — spoken words that aren't visible on screen are the most likely to be missed.
+Edit the `"text"` fields in `transcript.json` using a Python find-replace script. The subtitle script reads `text` fields directly, so corrections apply immediately — no need to touch word-level tokens or the .ass file.
 
 ### 3. Preview and edit subtitles
 
