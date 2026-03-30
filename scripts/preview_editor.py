@@ -799,6 +799,12 @@ def main():
             print(f"❌ File not found: {p}")
             sys.exit(1)
 
+    # Save pre-edit snapshot for Claude to diff after the session
+    import shutil
+    orig_backup = TRANSCRIPT_PATH + ".orig.json"
+    shutil.copy2(TRANSCRIPT_PATH, orig_backup)
+    print(f"[preview] Snapshot saved: {orig_backup}")
+
     url = f"http://localhost:{PORT}"
     print(f"[preview] Video:     {VIDEO_PATH}")
     print(f"[preview] Transcript: {TRANSCRIPT_PATH}")

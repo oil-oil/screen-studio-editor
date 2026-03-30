@@ -155,6 +155,24 @@ Then follow the **Subtitle workflow** below with `/tmp/transcript.json` as the t
 
 ## Subtitle workflow
 
+### 0. Apply glossary before reviewing
+
+`SKILL_DIR/glossary.json` is user-specific and gitignored — it won't exist on a fresh install. If it doesn't exist, skip this step. If it does, apply all entries as automated corrections before manual review.
+
+The glossary is case-insensitive. Format: `[{"wrong": "...", "correct": "..."}]`
+
+```python
+import json, re
+from pathlib import Path
+
+glossary_path = Path(SKILL_DIR) / "glossary.json"
+if glossary_path.exists():
+    glossary = json.loads(glossary_path.read_text())
+    for seg in segments:
+        for entry in glossary:
+            seg["text"] = re.sub(re.escape(entry["wrong"]), entry["correct"], seg["text"], flags=re.IGNORECASE)
+```
+
 ### 1. Semantic review — correct transcript.json
 
 Read the full transcript text first. Look for words that are **semantically inconsistent with the surrounding context** — Whisper mishears phonetically similar words. For every suspicious word, classify it:
@@ -213,6 +231,37 @@ Tell the user: "已在浏览器中打开字幕预览编辑器，请检查字幕�
 **Wait for the user to confirm** before proceeding to burn. Do not burn until they say the subtitles look good.
 
 **Note on save format**: The preview editor saves transcript.json wrapped as `{"segments": [...]}`. The burn script handles both this format and plain arrays, so no conversion is needed.
+
+### 3.5 Update glossary after user saves
+
+After the user confirms the subtitles look good, diff the original snapshot against the saved transcript to find what the user changed. The preview editor saves a `.orig.json` backup automatically at startup.
+
+```python
+import json, difflib
+
+with open("/path/to/transcript.json.orig.json") as f:
+    orig = json.load(f)
+with open("/path/to/transcript.json") as f:
+    edited = json.load(f)
+
+orig_segs  = orig.get("segments", orig)   if isinstance(orig, dict)   else orig
+edit_segs  = edited.get("segments", edited) if isinstance(edited, dict) else edited
+
+orig_by_start = {s["start"]: s["text"].strip() for s in orig_segs}
+for s in edit_segs:
+    orig_text = orig_by_start.get(s["start"], "")
+    if orig_text and orig_text != s["text"].strip():
+        print(f'CHANGED [{s["start"]:.1f}s]')
+        print(f'  before: {orig_text}')
+        print(f'  after:  {s["text"].strip()}')
+```
+
+Read the diff output and decide **which changes represent systematic Whisper misrecognitions** (i.e., patterns that will recur in future videos). Add those to `SKILL_DIR/glossary.json`. Do NOT add:
+- one-time content fixes (wrong date, specific name that won't repeat)
+- deletions (the user removed a subtitle entirely)
+- minor punctuation or style tweaks
+
+Glossary format: `{"wrong": "whisper_output", "correct": "true_term"}` — case-insensitive, one canonical entry per pattern.
 
 ### 4. Burn subtitles
 
