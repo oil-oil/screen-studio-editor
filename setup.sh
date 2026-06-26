@@ -1,7 +1,7 @@
 #!/bin/bash
 # Screen Studio Editor — one-time setup
 # Run once after installing the skill: bash setup.sh
-# Requirements: macOS on Apple Silicon (M1/M2/M3), Homebrew
+# Requirements: macOS, Homebrew
 
 set -e
 
@@ -14,15 +14,10 @@ echo ""
 
 # 1. Check platform
 if [[ "$(uname)" != "Darwin" ]]; then
-    echo "ERROR: This skill requires macOS (Apple Silicon)."
+    echo "ERROR: This skill requires macOS."
     exit 1
 fi
-if [[ "$(uname -m)" != "arm64" ]]; then
-    echo "ERROR: This skill requires Apple Silicon (M1/M2/M3)."
-    echo "  mlx-whisper does not run on Intel Macs."
-    exit 1
-fi
-echo "[1/4] Platform: macOS Apple Silicon OK"
+echo "[1/4] Platform: macOS OK"
 
 # 2. Check ffmpeg
 if ! command -v ffmpeg &>/dev/null; then
@@ -42,20 +37,24 @@ if [[ ! -d ".venv" ]]; then
     python3 -m venv .venv
 fi
 .venv/bin/pip install --quiet --upgrade pip
-.venv/bin/pip install --quiet mlx-whisper
+# flask powers the Mode B subtitle preview server; jieba is used for CJK
+# subtitle segmentation when burning. Keep both in sync with the imports in
+# scripts/preview_editor.py and scripts/burn_subtitles.py.
+if [[ "$(uname -m)" == "arm64" ]]; then
+    .venv/bin/pip install --quiet mlx-whisper jieba flask
+else
+    .venv/bin/pip install --quiet openai-whisper jieba flask
+fi
 echo "      Python venv ready"
 
-# 4. Pre-download Whisper large-v3 model (~3 GB, one-time)
-echo "[4/4] Downloading Whisper large-v3 model (~3 GB, one-time)..."
-echo "      This may take a few minutes on first run."
-"$SKILL_DIR/.venv/bin/python3" -c "
-import mlx_whisper, tempfile, subprocess, os
-tmp = tempfile.mktemp(suffix='.wav')
-subprocess.run(['ffmpeg','-f','lavfi','-i','anullsrc=r=16000:cl=mono','-t','1',tmp,'-y','-loglevel','quiet'])
-mlx_whisper.transcribe(tmp, path_or_hf_repo='mlx-community/whisper-large-v3-mlx', language='zh')
-os.unlink(tmp)
-print('Model downloaded and verified.')
-"
+# 4. Verify dependencies
+echo "[4/4] Verifying dependencies..."
+if [[ "$(uname -m)" == "arm64" ]]; then
+    "$SKILL_DIR/.venv/bin/python3" -c "import mlx_whisper; print('mlx-whisper verified.')"
+else
+    "$SKILL_DIR/.venv/bin/python3" -c "import whisper; print('openai-whisper verified.')"
+fi
+"$SKILL_DIR/.venv/bin/python3" -c "import flask, jieba; print('flask + jieba verified.')"
 
 echo ""
 echo "=== Setup complete ==="

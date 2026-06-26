@@ -12,7 +12,7 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
 
 **Mode B — Subtitle burning for any .mp4**
 - Works with any video, not just Screen Studio exports
-- Transcribes audio locally with Whisper (no API calls, no cost)
+- Transcribes audio locally with a Whisper-family model
 - Launches a live preview editor in the browser so you can review and fix subtitles before burning
 - Handles iPhone portrait videos, AAC timestamp drift, and mixed CJK/Latin content
 
@@ -22,9 +22,10 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
 
 ## Requirements
 
-- macOS on Apple Silicon (M1/M2/M3) — `mlx-whisper` requires Apple Silicon
+- macOS
 - [Claude Code](https://claude.ai/code)
 - [Homebrew](https://brew.sh) (for ffmpeg)
+- A local Whisper-family model cache for transcription
 
 ## Installation
 
@@ -33,7 +34,7 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
    ~/.agents/skills/screen-studio-editor/
    ```
 
-2. Run the one-time setup (installs ffmpeg, Python venv, and downloads the Whisper large-v3 model ~3 GB):
+2. Run the one-time setup (installs ffmpeg, Python venv, local transcription dependencies, and Chinese phrase splitting):
    ```bash
    bash ~/.agents/skills/screen-studio-editor/setup.sh
    ```
@@ -50,7 +51,7 @@ Claude will handle the rest — transcribing, editing the timeline, launching th
 
 ## How subtitles work
 
-Transcription runs fully locally using [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Whisper large-v3 on Apple Silicon). No data leaves your machine.
+Transcription uses a local Whisper-family model with sentence and word timestamps when the backend supports them. On Apple Silicon, the default backend is `mlx-whisper` with a locally cached `mlx-community/whisper-large-v3-mlx` snapshot when available; on Intel Macs, setup installs `openai-whisper` as the fallback. Audio stays on the machine.
 
 Before burning, a browser-based preview editor opens so you can:
 - Review all subtitles synced with video playback
@@ -58,10 +59,13 @@ Before burning, a browser-based preview editor opens so you can:
 - Check/uncheck to delete lines
 - Find & replace across all subtitles
 
+The burn step uses the original word-level timestamps for timing, removes display punctuation from final captions, and should be preceded by an agent line-by-line draft check for broken phrases, name corrections, and awkward subtitle boundaries.
+
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
+| `scripts/local_transcribe.py` | Transcribe local audio with a local model and convert it to transcript.json |
 | `scripts/process.py` | Edit .screenstudio timeline (remove pauses, apply cuts) |
 | `scripts/burn_subtitles.py` | Burn ASS subtitles onto a video with ffmpeg |
 | `scripts/preview_editor.py` | Local HTTP server for the subtitle preview/edit UI |

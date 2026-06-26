@@ -158,6 +158,7 @@ def merge_projects(
     supplement_dir: Path,
     output_dir: Path,
     insert_after_slice: int | None,
+    force: bool = False,
 ):
     log(f"Base:       {base_dir.name}")
     log(f"Supplement: {supplement_dir.name}")
@@ -186,10 +187,13 @@ def merge_projects(
 
     # ── Create output from base ───────────────────────────────────────────────
     if output_dir.exists():
-        log(f"⚠️  Output already exists: {output_dir}")
-        resp = input("Overwrite? [y/N]: ").strip().lower()
-        if resp != "y":
-            log("Aborted."); sys.exit(0)
+        # No interactive prompt here on purpose: this script is usually run by an
+        # agent in a non-interactive shell, where input() would hang forever.
+        if not force:
+            log(f"❌ Output already exists: {output_dir}")
+            log("   Re-run with --force to overwrite, or pass a different --output path.")
+            sys.exit(1)
+        log(f"⚠️  Output exists — overwriting because --force was given: {output_dir}")
         shutil.rmtree(output_dir)
 
     shutil.copytree(base_dir, output_dir)
@@ -327,6 +331,8 @@ def main():
     parser.add_argument("--supplement", required=True)
     parser.add_argument("--output",     default=None)
     parser.add_argument("--insert-after-slice", type=int, default=None, metavar="N")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite the output directory if it already exists")
     args = parser.parse_args()
 
     base_dir = Path(args.base)
@@ -340,7 +346,7 @@ def main():
         Path(args.output) if args.output
         else base_dir.parent / f"{base_dir.stem}_Merged.screenstudio"
     )
-    merge_projects(base_dir, supp_dir, output_dir, args.insert_after_slice)
+    merge_projects(base_dir, supp_dir, output_dir, args.insert_after_slice, args.force)
 
 
 if __name__ == "__main__":

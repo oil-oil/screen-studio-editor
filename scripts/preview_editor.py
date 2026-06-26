@@ -9,7 +9,6 @@ import json
 import os
 import sys
 import threading
-import webbrowser
 from pathlib import Path
 
 from flask import (
@@ -315,6 +314,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .current-subtitle { font-size: clamp(11px, 3.5vw, 16px); }
   }
 </style>
+<script src="oil://bridge/html-v1.js"></script>
 </head>
 <body>
 
@@ -359,7 +359,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const LS_KEY = 'subtitle_editor_v1';
+const LS_KEY = __CACHE_KEY__;
 
 // ── state ────────────────────────────────────────────────────────────────────
 let segments = [];
@@ -442,7 +442,13 @@ async function init() {
       const data = JSON.parse(cached);
       segments = data.segments || [];
       deletedIds = new Set(data.deletedIds || []);
-      statusTxt.textContent = '已从 localStorage 恢复编辑进度';
+      // If cache has 0 segments it's stale — fall back to server
+      if (segments.length === 0) {
+        localStorage.removeItem(LS_KEY);
+        await loadFromServer();
+      } else {
+        statusTxt.textContent = '已从 localStorage 恢复编辑进度';
+      }
     } catch {
       await loadFromServer();
     }
@@ -734,13 +740,37 @@ document.getElementById('btnSave').addEventListener('click', async () => {
     body: JSON.stringify({ segments: toSave })
   });
 
-  if (res.ok) {
-    localStorage.removeItem(LS_KEY);
-    statusTxt.textContent = `✅ 已保存 ${toSave.length} 条字幕，可以关闭此标签页`;
-    window.close(); // may be blocked by browser; user can close manually
-  } else {
+  if (!res.ok) {
     statusTxt.textContent = '保存失败，请重试';
+    return;
   }
+
+  localStorage.removeItem(LS_KEY);
+
+  // Notify the Agent via the Oil interactive-page bridge (if available).
+  // Falls back to postMessage when running inside an iframe wrapper.
+  // Failure here is non-fatal — the transcript is already saved to disk.
+  let notified = false;
+  try {
+    if (window.Oil && typeof window.Oil.sendMessage === 'function') {
+      await window.Oil.sendMessage({ text: '检查完成，开始烧录', closePreview: true });
+      notified = true;
+    } else if (window.parent !== window) {
+      window.parent.postMessage({
+        type: 'SAVE_DONE',
+        text: '检查完成，开始烧录',
+        closePreview: true
+      }, '*');
+      notified = true;
+    }
+  } catch (err) {
+    console.warn('通知 Agent 失败:', err);
+  }
+
+  statusTxt.textContent = notified
+    ? `✅ 已保存 ${toSave.length} 条字幕，已通知 Agent 继续烧录`
+    : `✅ 已保存 ${toSave.length} 条字幕，可关闭此页面`;
+  window.close(); // may be blocked by browser; user can close manually
 });
 </script>
 </body>
@@ -752,7 +782,9 @@ document.getElementById('btnSave').addEventListener('click', async () => {
 # ----------------------------------------------------------------------------- #
 @app.route("/")
 def index():
-    return Response(HTML_TEMPLATE, content_type="text/html; charset=utf-8")
+    cache_key = f"subtitle_editor_v1:{VIDEO_PATH}:{TRANSCRIPT_PATH}"
+    html = HTML_TEMPLATE.replace("__CACHE_KEY__", json.dumps(cache_key))
+    return Response(html, content_type="text/html; charset=utf-8")
 
 
 @app.route("/video")
@@ -764,8 +796,15 @@ def video():
 
 @app.route("/api/transcript", methods=["GET"])
 def get_transcript():
+    # Use parse_constant=None to handle NaN/Infinity from Whisper output
     with open(TRANSCRIPT_PATH, encoding="utf-8") as f:
-        data = json.load(f)
+        raw = f.read()
+    import math, re as _re
+    # Replace bare NaN/Infinity tokens (not valid JSON) with null
+    raw = _re.sub(r'\bNaN\b', 'null', raw)
+    raw = _re.sub(r'\bInfinity\b', 'null', raw)
+    raw = _re.sub(r'\b-Infinity\b', 'null', raw)
+    data = json.loads(raw)
     # Support both {"segments": [...]} and plain [...]
     segs = data.get("segments", data) if isinstance(data, dict) else data
     return jsonify({"segments": segs})
@@ -805,11 +844,10 @@ def main():
     shutil.copy2(TRANSCRIPT_PATH, orig_backup)
     print(f"[preview] Snapshot saved: {orig_backup}")
 
-    url = f"http://localhost:{PORT}"
     print(f"[preview] Video:     {VIDEO_PATH}")
     print(f"[preview] Transcript: {TRANSCRIPT_PATH}")
-    print(f"[preview] Opening  {url} …")
-    webbrowser.open(url)
+    print(f"[preview] Flask running on http://localhost:{PORT}")
+    print(f"[preview] Agent 将创建交互页包装器在 Oil 内置浏览器中打开")
 
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     print("[preview] Exiting.")
