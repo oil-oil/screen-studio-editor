@@ -23,14 +23,20 @@ def log(msg):
 
 
 def set_display_replacements(entries: list[dict]):
-    """Configure case-insensitive text replacements applied to final captions."""
+    """Configure case-insensitive text replacements applied to final captions.
+
+    Patterns are whitespace-tolerant: spacing drifts at every stage (ASR
+    tokens, CJK/Latin spacing), so "GPT55" must also match "GPT 55" and
+    "cloud call" must match "cloudcall".
+    """
     global _DISPLAY_REPLACEMENTS
     replacements = []
     for entry in entries:
         wrong = (entry.get("wrong") or "").strip()
         correct = entry.get("correct")
         if wrong and isinstance(correct, str):
-            replacements.append((re.compile(re.escape(wrong), re.IGNORECASE), correct))
+            parts = [re.escape(ch) for ch in wrong if not ch.isspace()]
+            replacements.append((re.compile(r"\s*".join(parts), re.IGNORECASE), correct))
     _DISPLAY_REPLACEMENTS = replacements
 
 
@@ -212,7 +218,7 @@ def _merge_spelled_latin_tokens(tokens: list[dict]) -> list[dict]:
 
 _SOFT_PUNCT = "，,、；;：:"
 _HARD_PUNCT = "。！？!?"
-_DISPLAY_PUNCT = _SOFT_PUNCT + _HARD_PUNCT + "…"
+_DISPLAY_PUNCT = _SOFT_PUNCT + _HARD_PUNCT + "…."
 
 
 def _strip_display_punctuation(text: str) -> str:
@@ -250,9 +256,22 @@ def _line_duration(tokens: list[dict]) -> float:
     return max(0.0, tokens[-1]["end"] - tokens[0]["start"]) if tokens else 0.0
 
 
+_WEAK_START_CHARS = {"的", "了", "着", "过", "们", "吗", "呢", "吧", "啊"}
+_WEAK_START_WHITELIST = (
+    "的确", "了解", "了不起", "着重", "着急", "着手", "着眼",
+    "过程", "过去", "过后", "过来", "过于", "过年", "过度", "过滤",
+)
+
+
 def _is_function_particle(text: str) -> bool:
-    """Small grammar-only check for characters that should not start a subtitle."""
-    return len(text) == 1 and text in {"的", "了", "着", "过", "们", "子", "吗", "呢", "吧", "啊"}
+    """
+    True when a subtitle must not START with this token: a grammatical particle
+    gluing it to the previous phrase ("的一个…"). Tokenizers often attach 的/了
+    to the following word, so check the first character, not just 1-char tokens.
+    """
+    if not text or text[0] not in _WEAK_START_CHARS:
+        return False
+    return not text.startswith(_WEAK_START_WHITELIST)
 
 
 def _is_unbalanced_single_char(text: str) -> bool:
@@ -298,9 +317,21 @@ def _boundary_score(tokens: list[dict], idx: int, max_chars: int) -> float:
         score -= (duration - 4.2) * 18
 
     if _is_function_particle(next_text):
-        score -= 45
+        score -= 80
     if next_token and _is_unbalanced_single_char(prev_text) and raw_tail not in _HARD_PUNCT + _SOFT_PUNCT:
         score -= 18
+    # Never break between Latin/digit characters without punctuation or a real
+    # pause — that splits an English word or product name across two subtitles.
+    # "." counts as part of the run so version numbers ("GPT5" + "." + "5")
+    # are not split either.
+    if (
+        next_token is not None
+        and re.fullmatch(r"[A-Za-z0-9.]", (prev_text or " ")[-1])
+        and re.fullmatch(r"[A-Za-z0-9.]", (next_text or " ")[0])
+        and raw_tail not in _HARD_PUNCT + _SOFT_PUNCT
+        and gap < 0.22
+    ):
+        score -= 250
     if raw_tail in _SOFT_PUNCT:
         score -= 6
     if next_token is None:
@@ -376,7 +407,7 @@ def _merge_short_lines(lines: list[dict], max_chars: int) -> list[dict]:
         should_merge = (
             (length < min_chars or duration < min_duration)
             and combined_len <= max_chars * 1.08
-            and combined_dur <= 4.8
+            and combined_dur <= 4.2
             and gap <= 0.45
         )
 
@@ -401,10 +432,15 @@ def _filter_noise_lines(lines: list[dict]) -> list[dict]:
 
 
 def _display_normalized(text: str) -> str:
-    """Normalize display text for comparing corrected segment text with ASR words."""
+    """Normalize display text for comparing corrected segment text with ASR words.
+
+    Keep case differences significant. Preview edits often only fix product-name
+    casing, such as "skill" -> "Skill"; word-level ASR tokens must not override
+    those confirmed display edits.
+    """
     text = _apply_display_replacements(text)
     text = _strip_display_punctuation(text)
-    return re.sub(r"\s+", "", text).lower()
+    return re.sub(r"\s+", "", text)
 
 
 def _words_to_timed_lines(seg: dict, max_chars: int) -> list[dict]:
@@ -487,7 +523,7 @@ def seconds_to_ass_time(s: float) -> str:
 
 def final_display_text(text: str) -> str:
     """Apply the last display-only cleanup after line merging."""
-    return _apply_display_replacements(add_cjk_spacing(text))
+    return _apply_display_replacements(add_cjk_spacing(_strip_display_punctuation(text)))
 
 
 def _subtitle_style_metrics(video_width: int, video_height: int) -> tuple[int, int]:
@@ -688,7 +724,8 @@ def _render_progress(elapsed_us: int, total_s: float, speed: float):
 def burn_subtitles(video_path: Path, ass_path: Path, output_path: Path,
                    scale_to: tuple[int, int] | None = None,
                    filter_prefix: list[str] | None = None,
-                   total_duration_s: float = 0):
+                   total_duration_s: float = 0,
+                   encoder: str = "x264"):
     """Burn ASS subtitles into video using ffmpeg.
 
     scale_to: (width, height) to scale before rendering subtitles.
@@ -711,17 +748,27 @@ def burn_subtitles(video_path: Path, ass_path: Path, output_path: Path,
     vf_parts.append(f"ass='{ass_str}'")
     vf = ",".join(vf_parts)
 
-    if scale_to or filter_prefix:
-        # H264 for filtered square/downscaled output (faster, smaller file)
-        video_codec = ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
-        if scale_to:
-            log(f"Scaling to {scale_to[0]}x{scale_to[1]}")
+    if scale_to:
+        log(f"Scaling to {scale_to[0]}x{scale_to[1]}")
+    if encoder == "videotoolbox":
+        if scale_to or filter_prefix:
+            # H264 for filtered square/downscaled output (smaller file)
+            video_codec = ["-c:v", "h264_videotoolbox", "-b:v", "8M"]
+        else:
+            # HEVC quality-based encoding — matches original iPhone/Screen Studio quality
+            # -q:v 65 on hevc_videotoolbox ≈ visually lossless for 4K source
+            # -tag:v hvc1 ensures broad player compatibility (hev1 tag breaks QPlayer etc.)
+            video_codec = ["-c:v", "hevc_videotoolbox", "-q:v", "65", "-tag:v", "hvc1"]
+        log("VideoToolbox hardware encoding")
     else:
-        # HEVC quality-based encoding — matches original iPhone/Screen Studio quality
-        # -q:v 65 on hevc_videotoolbox ≈ visually lossless for 4K source
-        # -tag:v hvc1 ensures broad player compatibility (hev1 tag breaks QPlayer etc.)
-        video_codec = ["-c:v", "hevc_videotoolbox", "-q:v", "65", "-tag:v", "hvc1"]
-        log("Keeping original resolution (HEVC quality mode)")
+        # Software x264 outruns the M-series media engine on wall clock (~2.3x on
+        # M5 at 2880x2160) with equal-or-better SSIM and smaller files, and H264
+        # is what video platforms prefer for uploads. veryfast+crf20 is the
+        # measured sweet spot; the media engine is a fixed-throughput bottleneck
+        # that parallel sessions and quality settings cannot speed up.
+        video_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                       "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        log("x264 software encoding (veryfast, crf 20)")
 
     progress_path = Path("/tmp/ffmpeg_burn_progress.txt")
     progress_path.unlink(missing_ok=True)
@@ -784,6 +831,10 @@ def main():
                         help="Crop the video to a centered 1:1 square before rendering subtitles.")
     parser.add_argument("--output-height", type=int, default=0,
                         help="Scale output: landscape uses height, portrait uses width, square-output uses side length. Default 0 = keep/crop at source size.")
+    parser.add_argument("--encoder", choices=["x264", "videotoolbox"], default="x264",
+                        help="Video encoder. Default x264 (software, ~2.3x faster than the "
+                             "media engine on Apple Silicon with equal quality). Use "
+                             "videotoolbox for the previous hardware HEVC/H264 behavior.")
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -921,7 +972,8 @@ def main():
     # Burn subtitles
     burn_subtitles(video_path, ass_path, output_path, scale_to=scale_to,
                    filter_prefix=filter_prefix,
-                   total_duration_s=video_duration)
+                   total_duration_s=video_duration,
+                   encoder=args.encoder)
 
     log("")
     log("=" * 50)

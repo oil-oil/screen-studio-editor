@@ -17,6 +17,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 
 def log(msg):
     print(f"[screen-studio-editor] {msg}", flush=True)
@@ -59,30 +63,80 @@ def get_mic_sessions(metadata: dict) -> list[dict]:
     return sorted(sessions, key=lambda s: s["processTimeStartMs"])
 
 
-def merge_audio(project_dir: Path, sessions: list[dict], output_path: Path) -> list[dict]:
+def _probe_duration_ms(path: Path) -> float | None:
+    """Return the media duration in ms via ffprobe, or None on failure."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(result.stdout.strip()) * 1000.0
+    except (ValueError, AttributeError):
+        return None
+
+
+def merge_audio(project_dir: Path, sessions: list[dict], output_path: Path, tmp_dir: Path) -> list[dict]:
     """
-    Merge all microphone .m4a segments into a single WAV (concatenated, no gap padding).
-    Returns session offset mappings for timestamp conversion:
-      [{"processTimeStartMs": ..., "audioOffsetMs": ..., "durationMs": ...}, ...]
-    audioOffsetMs = where this session starts in the merged audio (cumulative ms).
+    Merge all microphone segments into a single WAV (concatenated, no gap padding).
+
+    Two coordinate systems are involved and they are NOT the same:
+      - timelineOffsetMs: where this session starts in the slice source timeline.
+        Screen Studio lays sessions back-to-back by metadata durationMs
+        (verified against pristine multi-session projects: the single original
+        slice ends exactly at the sum of metadata durations).
+      - audioOffsetMs: where this session starts in the merged WAV. The actual
+        audio files run ~70-100ms longer than metadata durationMs per session
+        (occasionally seconds on older recordings), so this uses the decoded
+        WAV length of each session, not the metadata value.
+
+    Each session is decoded to its own 16 kHz mono WAV first so audioOffsetMs
+    is sample-exact by construction, then the WAVs are concatenated.
     """
     recording_dir = project_dir / "recording"
     valid_sessions = []
-    current_offset_ms = 0.0
+    timeline_offset_ms = 0.0
+    audio_offset_ms = 0.0
 
-    for session in sessions:
+    for idx, session in enumerate(sessions):
         filename = session.get("outputFilename", "")
         mic_file = recording_dir / filename
         if not mic_file.exists():
             log(f"⚠️  Audio file not found: {filename}, skipping.")
+            # The slice timeline still reserves this session's span, so keep
+            # advancing the timeline offset even though there is no audio.
+            timeline_offset_ms += session["durationMs"]
             continue
+
+        session_wav = tmp_dir / f"session_{idx}.wav"
+        result = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-i", str(mic_file),
+             "-ar", "16000", "-ac", "1", str(session_wav), "-y"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed decoding {filename}: {result.stderr}")
+
+        real_ms = _probe_duration_ms(session_wav)
+        if real_ms is None:
+            log(f"⚠️  Could not measure decoded length of {filename}; using metadata duration.")
+            real_ms = session["durationMs"]
+
+        drift_ms = real_ms - session["durationMs"]
+        if abs(drift_ms) > 50:
+            log(f"ℹ️  Session {idx}: audio runs {drift_ms:+.0f}ms vs metadata "
+                f"(cumulative timeline correction {audio_offset_ms - timeline_offset_ms:+.0f}ms).")
+
         valid_sessions.append({
             "processTimeStartMs": session["processTimeStartMs"],
             "durationMs": session["durationMs"],
-            "audioOffsetMs": current_offset_ms,
-            "file": str(mic_file),
+            "timelineOffsetMs": timeline_offset_ms,
+            "audioOffsetMs": audio_offset_ms,
+            "realDurationMs": real_ms,
+            "file": str(session_wav),
         })
-        current_offset_ms += session["durationMs"]
+        timeline_offset_ms += session["durationMs"]
+        audio_offset_ms += real_ms
 
     if not valid_sessions:
         raise RuntimeError("No microphone audio files found in this project.")
@@ -113,9 +167,14 @@ def merge_audio(project_dir: Path, sessions: list[dict], output_path: Path) -> l
     return valid_sessions
 
 
-def transcribe(audio_path: Path, language: str | None = "zh") -> list[dict]:
+def transcribe(
+    audio_path: Path,
+    language: str | None = "zh",
+    backend: str = "bailian",
+    raw_output_path: Path | None = None,
+) -> list[dict]:
     """
-    Run a local Whisper-family ASR model on the audio file.
+    Run ASR on the audio file.
     Returns list of segments with word-level timestamps:
       [{"start": float, "end": float, "text": str, "words": [{"word": str, "start": float, "end": float}]}]
 
@@ -124,26 +183,139 @@ def transcribe(audio_path: Path, language: str | None = "zh") -> list[dict]:
     Pass --language en for English recordings, or --language None to auto-detect.
     """
     lang_display = language if language else "auto-detect"
-    log(f"🎙️  Transcribing locally (language={lang_display})...")
+    if backend == "bailian":
+        log(f"🎙️  Transcribing with Bailian FunAudio ASR (language={lang_display})...")
+        from bailian_transcribe import transcribe_file
 
-    from local_transcribe import transcribe_file
+        segments = transcribe_file(
+            audio_path,
+            language=language,
+            raw_output_path=raw_output_path,
+        )
+    elif backend == "local":
+        log(f"🎙️  Transcribing locally (language={lang_display})...")
+        from local_transcribe import transcribe_file
 
-    segments = transcribe_file(audio_path, language=language)
+        segments = transcribe_file(audio_path, language=language)
+    else:
+        raise RuntimeError(f"Unsupported ASR backend: {backend}")
     log(f"✅ Transcribed {len(segments)} segments, {sum(len(s.get('words', [])) for s in segments)} words.")
     return segments
 
 
-def map_audio_time_to_process_time(audio_offset_s: float, session_offsets: list[dict]) -> float:
+def map_audio_time_to_timeline_ms(audio_offset_s: float, session_offsets: list[dict]) -> float:
     """
-    Convert a timestamp in the merged audio (seconds) to slice coordinate.
+    Convert a timestamp in the merged audio (seconds) to slice-timeline ms.
 
-    The sourceStartMs / sourceEndMs fields in Screen Studio slices use the
-    *merged audio timeline* as their coordinate system: sessions are laid out
-    back-to-back starting at 0, with no gaps between them.  That means the
-    slice coordinate equals the merged-audio offset in milliseconds — which is
-    simply the audio timestamp itself.
+    Screen Studio lays sessions back-to-back by metadata durationMs in the
+    slice source timeline, but each session's actual audio runs longer than
+    its metadata duration (typically +70..100ms, sometimes seconds). The
+    merged WAV therefore drifts further from the slice timeline with every
+    session. Map piecewise: find the session containing this audio timestamp
+    by real audio offsets, then re-anchor it at that session's timeline offset.
+    Within a session the clocks tick at the same rate, so only the anchor moves.
     """
-    return audio_offset_s * 1000.0
+    u = audio_offset_s * 1000.0
+    for s in reversed(session_offsets):
+        if u >= s["audioOffsetMs"]:
+            # Clamp to the session's timeline span: the audio tail that runs
+            # past metadata durationMs has no timeline position of its own.
+            delta = min(u - s["audioOffsetMs"], s["durationMs"])
+            return s["timelineOffsetMs"] + delta
+    return u
+
+
+def remap_segments_to_timeline(segments: list[dict], session_offsets: list[dict]) -> list[dict]:
+    """
+    Rewrite freshly transcribed segment/word timestamps (merged-audio seconds)
+    into slice-timeline seconds, so transcript.json and every downstream
+    consumer (cuts.json, wordless-slice checks) share the slices' coordinates.
+    Only call this on fresh ASR output — reused transcripts are already mapped.
+    """
+    def _map_s(t: float | None) -> float | None:
+        if t is None:
+            return None
+        return round(map_audio_time_to_timeline_ms(float(t), session_offsets) / 1000.0, 3)
+
+    remapped = []
+    for seg in segments:
+        new_seg = dict(seg)
+        new_seg["start"] = _map_s(seg.get("start"))
+        new_seg["end"] = _map_s(seg.get("end"))
+        new_seg["words"] = [
+            {**w, "start": _map_s(w.get("start")), "end": _map_s(w.get("end"))}
+            for w in seg.get("words", [])
+        ]
+        remapped.append(new_seg)
+    return remapped
+
+
+def remap_regions_to_timeline(
+    regions: list[tuple[float, float]], session_offsets: list[dict]
+) -> list[tuple[float, float]]:
+    """Rewrite silence regions (merged-audio seconds) into slice-timeline seconds."""
+    return [
+        (
+            map_audio_time_to_timeline_ms(start_s, session_offsets) / 1000.0,
+            map_audio_time_to_timeline_ms(end_s, session_offsets) / 1000.0,
+        )
+        for start_s, end_s in regions
+    ]
+
+
+def protect_words_from_cuts(
+    cuts: list[dict],
+    words: list[dict],
+    pad_ms: float = 60.0,
+    min_cut_ms: float = 300.0,
+) -> list[dict]:
+    """
+    Trim or split pause cuts so they never remove ASR-recognized speech.
+
+    Silence detection is the cut source, but a mis-set threshold (or quiet
+    speech) can classify real words as silence. Words are the safety net:
+    subtract every word interval (with padding) from each cut and keep only
+    the remaining pieces that are still worth cutting. Fillers were already
+    stripped from the transcript, so filler-only stretches still get cut.
+    """
+    if not cuts or not words:
+        return cuts
+
+    intervals = sorted(
+        (w["start"] * 1000.0 - pad_ms, w["end"] * 1000.0 + pad_ms)
+        for w in words
+        if w.get("start") is not None and w.get("end") is not None
+    )
+
+    protected = []
+    trimmed = 0
+    for cut in cuts:
+        pieces = [(cut["start_ms"], cut["end_ms"])]
+        for (ws, we) in intervals:
+            if we <= cut["start_ms"] or ws >= cut["end_ms"]:
+                continue
+            new_pieces = []
+            for (ps, pe) in pieces:
+                if we <= ps or ws >= pe:
+                    new_pieces.append((ps, pe))
+                    continue
+                if ws > ps:
+                    new_pieces.append((ps, ws))
+                if we < pe:
+                    new_pieces.append((we, pe))
+            pieces = new_pieces
+        kept_pieces = [(ps, pe) for (ps, pe) in pieces if pe - ps >= min_cut_ms]
+        if len(kept_pieces) != 1 or kept_pieces[0] != (cut["start_ms"], cut["end_ms"]):
+            trimmed += 1
+        for (ps, pe) in kept_pieces:
+            piece = dict(cut)
+            piece["start_ms"] = ps
+            piece["end_ms"] = pe
+            protected.append(piece)
+
+    if trimmed:
+        log(f"🛡️  Word protection adjusted {trimmed} pause cut(s) that overlapped recognized speech.")
+    return protected
 
 
 def flatten_words(segments: list[dict]) -> list[dict]:
@@ -199,7 +371,6 @@ def detect_pauses_from_silence(
     silence_regions: list[tuple[float, float]],
     threshold_ms: float,
     min_pause_ms: float,
-    session_offsets: list[dict],
     segments: list[dict],
 ) -> list[dict]:
     """
@@ -207,6 +378,7 @@ def detect_pauses_from_silence(
 
     ASR word timestamps are useful context, but they drift by tens or hundreds of
     milliseconds. Real silence is the safer source of truth for jump cuts.
+    Both silence regions and segments must already be in slice-timeline coordinates.
     """
     words = flatten_words(segments)
     pauses = []
@@ -226,8 +398,8 @@ def detect_pauses_from_silence(
             continue
 
         cut = {
-            "start_ms": map_audio_time_to_process_time(cut_start_s, session_offsets),
-            "end_ms": map_audio_time_to_process_time(cut_end_s, session_offsets),
+            "start_ms": cut_start_s * 1000.0,
+            "end_ms": cut_end_s * 1000.0,
             "duration_ms": region_ms,
             "source": "silence",
         }
@@ -237,7 +409,7 @@ def detect_pauses_from_silence(
     return pauses
 
 
-def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_ms: float, session_offsets: list[dict]) -> list[dict]:
+def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_ms: float) -> list[dict]:
     """
     Detect pauses between words longer than threshold_ms.
     Returns list of {"start_process_ms": ..., "end_process_ms": ..., "duration_ms": ...}
@@ -271,11 +443,9 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
             # Skip cuts shorter than 300ms: ASR timestamp inaccuracy (±50-200ms)
             # means a tiny cut is more likely to clip real speech than remove silence.
             if cut_end_s > cut_start_s and cut_duration_ms >= 300:
-                start_pm = map_audio_time_to_process_time(cut_start_s, session_offsets)
-                end_pm = map_audio_time_to_process_time(cut_end_s, session_offsets)
                 pauses.append({
-                    "start_ms": start_pm,
-                    "end_ms": end_pm,
+                    "start_ms": cut_start_s * 1000.0,
+                    "end_ms": cut_end_s * 1000.0,
                     "duration_ms": gap_ms,
                     "text_before": words[i]["word"].strip(),
                     "text_after": words[i + 1]["word"].strip(),
@@ -445,16 +615,11 @@ def detect_repeats(cuts_file: str) -> list[dict]:
 
 def get_session_boundaries_ms(session_offsets: list[dict]) -> list[float]:
     """
-    Return the merged-audio timestamps (in ms) at which each new recording session begins.
+    Return the slice-timeline positions (in ms) at which each new recording session begins.
     These are the "natural" transition points that Screen Studio originally placed between sessions.
     The first session always starts at 0 so only boundaries *between* sessions are returned.
     """
-    boundaries = []
-    cumulative = 0.0
-    for s in session_offsets:
-        cumulative += s["durationMs"]
-        boundaries.append(cumulative)
-    return boundaries[:-1]  # exclude the very end; only inter-session boundaries
+    return [s["timelineOffsetMs"] for s in session_offsets[1:]]
 
 
 _SNAP_MARGIN_MS = 10  # snap 10ms before boundary; see snap_to_session_boundaries docstring
@@ -472,12 +637,12 @@ def snap_to_session_boundaries(slices: list[dict], boundaries_ms: list[float]) -
     the pair source-contiguous (gap = 0 ms) and re-enables Screen Studio's spring
     animation without undoing a real pause cut.
 
-    Why the margin is necessary: metadata durationMs and the actual WAV file length
-    differ by ~0.3 µs.  Snapping to the exact boundary causes Screen Studio's audio
-    composer to generate a sub-millisecond segment at the session seam, which it
-    rejects ("Invalid time range: duration must be positive").  A 10 ms margin
-    produces a short but valid segment (~10 ms of near-silence from the tail of
-    session N) that the audio composer accepts.  10 ms is imperceptible.
+    Why the margin is necessary: floating-point session durations mean an exact
+    boundary snap can generate a sub-millisecond segment at the session seam,
+    which Screen Studio's audio composer rejects ("Invalid time range: duration
+    must be positive").  A 10 ms margin produces a short but valid segment
+    (~10 ms of near-silence from the tail of session N) that the audio composer
+    accepts.  10 ms is imperceptible.
 
     Never restore a transition by moving either endpoint far away from the cut that
     pause detection chose. If the boundary lands in the middle of a long silence,
@@ -526,11 +691,16 @@ def remove_wordless_pause_slices(
     leave a standalone silent slice after the boundary. These clips show up in the
     timeline as "Clip 2s/3s" blocks with no meaningful waveform. They are too long
     for the old tiny-fragment filter, so clean them up explicitly.
+
+    Without a transcript the "no words in this slice" check cannot protect
+    speech, so the near-jump-cut heuristic is disabled and only slices that are
+    mostly measured silence are removed.
     """
     if not slices:
         return slices, []
 
     words = flatten_words(segments)
+    words_available = bool(words)
     removed = []
     kept = []
 
@@ -562,7 +732,9 @@ def remove_wordless_pause_slices(
             silence_overlap_ms += max(0.0, min(end_ms, silence_end_ms) - max(start_ms, silence_start_ms))
 
         mostly_measured_silence = duration_ms > 0 and silence_overlap_ms / duration_ms >= 0.5
-        near_jump_cut = prev_gap >= min_adjacent_gap_ms or next_gap >= min_adjacent_gap_ms
+        near_jump_cut = words_available and (
+            prev_gap >= min_adjacent_gap_ms or next_gap >= min_adjacent_gap_ms
+        )
 
         if mostly_measured_silence or near_jump_cut:
             removed.append({
@@ -652,6 +824,103 @@ def apply_cuts(slices: list[dict], cuts: list[dict]) -> tuple[list[dict], int]:
     return new_slices, cuts_applied
 
 
+def pad_repeat_cuts(repeats: list[dict]) -> list[dict]:
+    """
+    Add 150ms inward padding to repeat cuts to protect neighboring speech from clipping.
+    ASR start/end timestamps for a segment have ±100-200ms inaccuracy — the "start_ms"
+    of the region to remove might land slightly inside the last good word. Shrinking each
+    repeat cut inward by 150ms on both ends preserves the natural word onset/offset.
+    """
+    REPEAT_PAD_MS = 150
+    padded_repeats = []
+    for r in repeats:
+        padded = dict(r)
+        padded["start_ms"] = r["start_ms"] + REPEAT_PAD_MS
+        padded["end_ms"] = r["end_ms"] - REPEAT_PAD_MS
+        if padded["end_ms"] > padded["start_ms"] + 200:
+            padded_repeats.append(padded)
+        else:
+            log(f"⚠️  Repeat cut too short after padding, skipping: \"{r.get('removed_text','')[:50]}\"")
+    return padded_repeats
+
+
+def log_long_cuts(cuts: list[dict], threshold_ms: float = 5000.0):
+    """
+    Surface every long removal so the reviewing agent can sanity-check it.
+    A >5s cut is usually dead air, but it can also hide silent on-screen
+    action or sit next to an abandoned take that still needs a repeat cut.
+    """
+    long_cuts = [c for c in cuts if c["end_ms"] - c["start_ms"] > threshold_ms]
+    if not long_cuts:
+        return
+    log(f"⏱️  {len(long_cuts)} long removal(s) >{threshold_ms/1000:.0f}s — review that no on-screen action is lost:")
+    for c in long_cuts:
+        before = c.get("text_before") or c.get("removed_text") or ""
+        after = c.get("text_after") or ""
+        log(f"   {c['start_ms']/1000:8.2f}s → {c['end_ms']/1000:8.2f}s "
+            f"({(c['end_ms']-c['start_ms'])/1000:5.1f}s)  …{before[-20:]} ▶ {after[:20]}…")
+
+
+def load_external_edit_state(project_json_path: Path, state_path: Path) -> bool:
+    """Return True when project.json changed since our last write (external edit)."""
+    if not (state_path.exists() and project_json_path.exists()):
+        return False
+    try:
+        last_sha = json.loads(state_path.read_text()).get("last_written_sha")
+        return bool(last_sha) and last_sha != _file_sha256(project_json_path)
+    except Exception:
+        return False
+
+
+def run_incremental_repeat_cuts(project_json_path: Path, state_path: Path, cuts_file: str):
+    """
+    Apply repeat cuts on top of the CURRENT project.json without touching
+    anything else. Used when the project was edited externally (e.g. in
+    Screen Studio) after the first auto-edit run: re-applying from the backup
+    would discard those edits, so instead the new cuts are rebased onto the
+    current timeline. Cut coordinates are source-timeline ms, which survive
+    any slice rearrangement, so this is safe.
+    """
+    with open(project_json_path) as f:
+        project_data = json.load(f)
+
+    scenes = project_data.get("json", {}).get("scenes")
+    if not scenes or not scenes[0].get("slices"):
+        log("❌ project.json has no scenes/slices — unexpected format, aborting.")
+        sys.exit(1)
+
+    repeats = pad_repeat_cuts(detect_repeats(cuts_file))
+    if not repeats:
+        log("❌ No usable cuts in the cuts file — nothing to do.")
+        sys.exit(1)
+
+    original_slices = scenes[0]["slices"]
+    new_slices, cuts_applied = apply_cuts(original_slices, repeats)
+
+    original_duration = sum(s["sourceEndMs"] - s["sourceStartMs"] for s in original_slices)
+    new_duration = sum(s["sourceEndMs"] - s["sourceStartMs"] for s in new_slices)
+
+    project_data["json"]["scenes"][0]["slices"] = new_slices
+    with open(project_json_path, "w") as f:
+        json.dump(project_data, f, ensure_ascii=False, separators=(",", ":"))
+    try:
+        state_path.write_text(json.dumps({"last_written_sha": _file_sha256(project_json_path)}))
+    except Exception:
+        pass
+
+    log("")
+    log("=" * 50)
+    log("✅ Incremental repeat cuts applied to the CURRENT timeline (external edits preserved):")
+    log(f"   Repeats removed:   {len(repeats)}")
+    log(f"   Total cuts:        {cuts_applied}")
+    log(f"   Duration:          {original_duration/1000:.1f}s → {new_duration/1000:.1f}s "
+        f"(saved {(original_duration-new_duration)/1000:.1f}s)")
+    for r in repeats:
+        log(f"  ✂️  \"{r.get('removed_text', '')[:80]}\"")
+    log("")
+    log("Open Screen Studio to preview the result.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Screen Studio Auto-Editor")
     parser.add_argument("--project", required=True, help="Path to .screenstudio directory")
@@ -659,17 +928,23 @@ def main():
     parser.add_argument("--min-pause", type=float, default=300, help="Minimum pause to keep in ms (default: 300)")
     parser.add_argument("--pause-source", choices=["silence", "asr", "both"], default="silence",
                         help="How to find pause cuts. Default: measured silence. ASR is available as an opt-in fallback.")
-    parser.add_argument("--silence-db", default="-28",
-                        help="silencedetect noise floor in dB (default: -28), or 'auto' to derive it from "
-                             "the measured audio level (best practice — adapts to each recording's noise "
-                             "floor). Lower (e.g. -35) is stricter and keeps more audio (use if speech "
-                             "gets clipped); raise toward -20 to cut more aggressively or for noisy mics.")
+    parser.add_argument("--silence-db", default="auto",
+                        help="silencedetect noise floor in dB, or 'auto' (default) to derive it from the "
+                             "measured audio level — adapts to each recording's noise floor. Fixed values: "
+                             "lower (e.g. -35) is stricter and keeps more audio (use if speech gets "
+                             "clipped); raise toward -20 to cut more aggressively for noisy mics.")
     parser.add_argument("--silence-min-dur", type=float, default=0.3,
                         help="Minimum silence length in seconds for silencedetect (default: 0.3).")
     parser.add_argument("--cuts-file", default=None, help="JSON file with repeat cuts (produced by Claude in conversation)")
     parser.add_argument("--skip-transcribe", help="Path to existing transcript JSON to reuse")
     parser.add_argument("--language", default="zh",
                         help="ASR language code (default: zh). Use 'en' for English, 'None' to auto-detect.")
+    parser.add_argument("--asr-backend", choices=["bailian", "local"], default="bailian",
+                        help="ASR backend for transcript generation. Default: bailian. Use local only for explicit comparison or emergency fallback.")
+    parser.add_argument("--discard-external-edits", action="store_true",
+                        help="Re-apply everything from the original backup even if project.json was "
+                             "edited externally (e.g. in Screen Studio) since the last run, DISCARDING "
+                             "those external edits.")
     args = parser.parse_args()
 
     project_dir = Path(args.project)
@@ -688,19 +963,27 @@ def main():
     # Backup (no-op if backup already exists)
     backup_project(project_json_path)
 
-    # If project.json changed since our last run (e.g. someone edited it in
-    # Screen Studio), warn: every run re-applies edits from the pristine backup,
-    # so any external changes made since the last run will be discarded.
-    if backup_path.exists() and state_path.exists() and project_json_path.exists():
-        try:
-            last_sha = json.loads(state_path.read_text()).get("last_written_sha")
-            if last_sha and last_sha != _file_sha256(project_json_path):
-                log("⚠️  project.json changed since the last auto-edit run "
-                    "(did you edit it in Screen Studio?).")
-                log("    Edits always re-apply from the original backup (project.json.bak),")
-                log("    so changes made since the last run will be discarded.")
-        except Exception:
-            pass
+    # If project.json changed since our last run, someone edited it externally
+    # (opening/saving in Screen Studio counts). Re-applying from the backup
+    # would silently discard those edits, so:
+    #   - with --cuts-file: rebase the new repeat cuts onto the CURRENT
+    #     timeline and keep everything else untouched;
+    #   - otherwise: refuse, unless --discard-external-edits explicitly asks
+    #     to start over from the original backup.
+    externally_edited = backup_path.exists() and load_external_edit_state(project_json_path, state_path)
+    if externally_edited and not args.discard_external_edits:
+        log("⚠️  project.json changed since the last auto-edit run "
+            "(edited or re-saved in Screen Studio?).")
+        if args.cuts_file:
+            log("    Applying the new cuts incrementally to the CURRENT timeline; "
+                "external edits are preserved.")
+            run_incremental_repeat_cuts(project_json_path, state_path, args.cuts_file)
+            return
+        log("    Refusing to re-run the full edit: it would rebuild from project.json.bak")
+        log("    and DISCARD everything changed since the last run.")
+        log("    Either pass --cuts-file to add repeat cuts incrementally, or pass")
+        log("    --discard-external-edits to intentionally start over from the backup.")
+        sys.exit(2)
 
     # Always load from backup — it is created on the first run and never
     # overwritten, so it always holds the original unedited project.json.
@@ -724,22 +1007,55 @@ def main():
 
         # Merge audio
         merged_audio = tmp / "merged_mic.wav"
-        session_offsets = merge_audio(project_dir, mic_sessions, merged_audio)
+        session_offsets = merge_audio(project_dir, mic_sessions, merged_audio, tmp)
 
-        # Transcribe
+        # Transcribe. The transcript improves the edit (cut labeling, wordless-slice
+        # protection, repeat review) but silence-based pause cutting works without
+        # it, so an ASR outage degrades the run instead of aborting it.
+        transcript_ok = True
         if args.skip_transcribe:
+            # Reused transcripts were saved by a previous run and are already in
+            # slice-timeline coordinates — do not remap them again.
             with open(args.skip_transcribe) as f:
                 segments = json.load(f)
             log(f"♻️  Loaded existing transcript from {args.skip_transcribe}")
         else:
             lang = None if args.language == "None" else args.language
-            segments = transcribe(merged_audio, language=lang)
+            raw_asr_out = project_dir / "bailian_asr.json" if args.asr_backend == "bailian" else None
+            segments = None
+            last_error = None
+            for attempt in (1, 2):
+                try:
+                    segments = transcribe(
+                        merged_audio,
+                        language=lang,
+                        backend=args.asr_backend,
+                        raw_output_path=raw_asr_out,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    log(f"⚠️  ASR attempt {attempt} failed: {exc}")
+            if segments is None:
+                if args.pause_source != "silence":
+                    log("❌ ASR failed twice and --pause-source needs the transcript. Aborting.")
+                    log(f"   Last error: {last_error}")
+                    sys.exit(1)
+                transcript_ok = False
+                segments = []
+                log("⚠️  ASR failed twice — continuing with SILENCE-ONLY editing.")
+                log("    No transcript.json will be written: repeat review is not possible,")
+                log("    and wordless-slice cleanup runs in its conservative mode.")
 
-            # Save transcript for debugging
-            transcript_out = project_dir / "transcript.json"
-            with open(transcript_out, "w") as f:
-                json.dump(segments, f, indent=2, ensure_ascii=False)
-            log(f"💾 Saved transcript → transcript.json")
+            if transcript_ok:
+                # ASR timestamps are positions in the merged audio; rewrite them
+                # into slice-timeline coordinates so transcript.json matches the
+                # slices (and cuts.json values can be copied from it verbatim).
+                segments = remap_segments_to_timeline(segments, session_offsets)
+                transcript_out = project_dir / "transcript.json"
+                with open(transcript_out, "w") as f:
+                    json.dump(segments, f, indent=2, ensure_ascii=False)
+                log(f"💾 Saved transcript → transcript.json (slice-timeline coordinates)")
 
         # Measure the audio level so the silence threshold can adapt to (or be
         # sanity-checked against) this recording's actual loudness. A fixed dB
@@ -758,6 +1074,9 @@ def main():
         silence_regions = detect_silence_regions(
             merged_audio, noise_db=silence_db, min_dur=args.silence_min_dur
         )
+        # Silence was measured on the merged audio; move it into slice-timeline
+        # coordinates so every downstream consumer shares the slices' clock.
+        silence_regions = remap_regions_to_timeline(silence_regions, session_offsets)
 
         pause_cut_lists = []
         if args.pause_source in {"silence", "both"}:
@@ -766,13 +1085,12 @@ def main():
                     silence_regions,
                     args.pause_threshold,
                     args.min_pause,
-                    session_offsets,
                     segments,
                 )
             )
 
         if args.pause_source in {"asr", "both"}:
-            asr_pauses = detect_pauses_from_asr(segments, args.pause_threshold, args.min_pause, session_offsets)
+            asr_pauses = detect_pauses_from_asr(segments, args.pause_threshold, args.min_pause)
             # ASR-only cuts are still checked against real silence. If silence
             # detection finds nothing, do not cut on ASR timing alone by default.
             if silence_regions:
@@ -786,26 +1104,16 @@ def main():
 
         pauses = merge_cut_lists(pause_cut_lists)
 
-        # Load repeat cuts (produced by Claude in the conversation, if any)
-        repeats = detect_repeats(args.cuts_file)
+        # Safety net: silence thresholds can misjudge quiet speech, so never let
+        # a pause cut remove anything ASR recognized as a word. Repeat cuts are
+        # exempt — removing recognized speech is their entire purpose.
+        pauses = protect_words_from_cuts(pauses, flatten_words(segments))
 
-        # Add 150ms inward padding to repeat cuts to protect neighboring speech from clipping.
-        # ASR start/end timestamps for a segment have ±100-200ms inaccuracy — the "start_ms"
-        # of the region to remove might land slightly inside the last good word. Shrinking each
-        # repeat cut inward by 150ms on both ends preserves the natural word onset/offset.
-        REPEAT_PAD_MS = 150
-        padded_repeats = []
-        for r in repeats:
-            padded = dict(r)
-            padded["start_ms"] = r["start_ms"] + REPEAT_PAD_MS
-            padded["end_ms"] = r["end_ms"] - REPEAT_PAD_MS
-            if padded["end_ms"] > padded["start_ms"] + 200:
-                padded_repeats.append(padded)
-            else:
-                log(f"⚠️  Repeat cut too short after padding, skipping: \"{r.get('removed_text','')[:50]}\"")
-        repeats = padded_repeats
+        # Load repeat cuts (produced by Claude in the conversation, if any)
+        repeats = pad_repeat_cuts(detect_repeats(args.cuts_file))
 
         all_cuts = pauses + repeats
+        log_long_cuts(all_cuts)
 
         scenes = project_data.get("json", {}).get("scenes")
         if not scenes:
@@ -818,14 +1126,15 @@ def main():
             sys.exit(1)
         original_slices = scenes[0]["slices"]
 
-        # Sanity-check the coordinate-system assumption (slice ms == merged-audio
-        # offset). If slices extend far beyond the audio we merged, Screen Studio's
-        # format has probably changed and cuts would land in the wrong place.
-        total_audio_ms = sum(s["durationMs"] for s in session_offsets)
+        # Sanity-check the coordinate-system assumption (slice timeline == sessions
+        # laid back-to-back by metadata durationMs). If slices extend far beyond
+        # that span, Screen Studio's format has probably changed and cuts would
+        # land in the wrong place.
+        total_timeline_ms = sum(s["durationMs"] for s in mic_sessions)
         max_source_end = max((s.get("sourceEndMs", 0) for s in original_slices), default=0)
-        if total_audio_ms > 0 and max_source_end > total_audio_ms * 1.2:
-            log("⚠️  Slice timeline extends well beyond the merged audio "
-                f"(audio≈{total_audio_ms/1000:.1f}s, slices reach {max_source_end/1000:.1f}s).")
+        if total_timeline_ms > 0 and max_source_end > total_timeline_ms * 1.2:
+            log("⚠️  Slice timeline extends well beyond the recorded sessions "
+                f"(sessions≈{total_timeline_ms/1000:.1f}s, slices reach {max_source_end/1000:.1f}s).")
             log("    The .screenstudio format may have changed — verify the cuts carefully.")
 
         new_slices, cuts_applied = apply_cuts(original_slices, all_cuts)
@@ -879,6 +1188,12 @@ def main():
         log(f"   Rounded corners:   25 ✓")
         log(f"   Camera size:       30% ✓")
         log(f"   Camera position:   top-right ✓")
+        if not transcript_ok:
+            log("")
+            log("⚠️  SILENCE-ONLY RUN: ASR was unavailable, so there is no transcript.json.")
+            log("    Re-run later (without --skip-transcribe) for repeat review, or proceed")
+            log("    with pause-only editing.")
+
         log("")
         log("Open Screen Studio to preview the result.")
         log("Backup saved as project.json.bak")

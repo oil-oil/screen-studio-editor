@@ -8,11 +8,12 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
 - Automatically removes awkward pauses from the recording timeline
 - Detects and cuts repeated narration / false starts (Claude reads the transcript and decides what to remove)
 - Enables noise reduction and volume normalization
+- Uses Bailian FunAudio ASR for the transcript by default
 - Burns accurate subtitles onto the exported video
 
 **Mode B — Subtitle burning for any .mp4**
 - Works with any video, not just Screen Studio exports
-- Transcribes audio locally with a Whisper-family model
+- Transcribes audio with Bailian FunAudio ASR by default
 - Launches a live preview editor in the browser so you can review and fix subtitles before burning
 - Handles iPhone portrait videos, AAC timestamp drift, and mixed CJK/Latin content
 
@@ -25,7 +26,8 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
 - macOS
 - [Claude Code](https://claude.ai/code)
 - [Homebrew](https://brew.sh) (for ffmpeg)
-- A local Whisper-family model cache for transcription
+- Bailian CLI `bl` authenticated for the default ASR path
+- A local Whisper-family model cache only if you explicitly want old-model comparison or emergency fallback
 
 ## Installation
 
@@ -51,7 +53,7 @@ Claude will handle the rest — transcribing, editing the timeline, launching th
 
 ## How subtitles work
 
-Transcription uses a local Whisper-family model with sentence and word timestamps when the backend supports them. On Apple Silicon, the default backend is `mlx-whisper` with a locally cached `mlx-community/whisper-large-v3-mlx` snapshot when available; on Intel Macs, setup installs `openai-whisper` as the fallback. Audio stays on the machine.
+Editing and standalone subtitle burning use Bailian FunAudio ASR through `bl speech recognize` by default and convert the result into the same `transcript.json` shape used by the existing preview and burn scripts. Bailian speech recognition does not take a free-form prompt for style instructions, so `scripts/bailian_transcribe.py` removes standalone fillers such as `呃`, `嗯`, and `啊` after ASR while keeping the raw response available for debugging. The old local Whisper-family path remains available only when explicitly requested for comparison or emergency fallback. The Bailian path sends extracted audio to Bailian; the local path keeps audio on the machine.
 
 Before burning, a browser-based preview editor opens so you can:
 - Review all subtitles synced with video playback
@@ -65,7 +67,8 @@ The burn step uses the original word-level timestamps for timing, removes displa
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/local_transcribe.py` | Transcribe local audio with a local model and convert it to transcript.json |
+| `scripts/bailian_transcribe.py` | Transcribe local audio/video with Bailian ASR and convert it to transcript.json |
+| `scripts/local_transcribe.py` | Transcribe local audio with a local model and convert it to transcript.json as a fallback |
 | `scripts/process.py` | Edit .screenstudio timeline (remove pauses, apply cuts) |
 | `scripts/burn_subtitles.py` | Burn ASS subtitles onto a video with ffmpeg |
 | `scripts/preview_editor.py` | Local HTTP server for the subtitle preview/edit UI |

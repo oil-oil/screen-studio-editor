@@ -25,6 +25,8 @@ from flask import (
 PORT = 8765
 TRANSCRIPT_PATH = None
 VIDEO_PATH = None
+MANIFEST = None       # 多语言模式:解析后的 manifest dict
+WORKSPACE = None      # 多语言模式:manifest 所在目录
 RESULT_DONE = threading.Event()
 
 # ----------------------------------------------------------------------------- #
@@ -40,14 +42,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>字幕编辑器</title>
 <style>
   :root {
-    --bg: #f5f5f3;
+    --bg: #f4f3fb;
     --surface: #ffffff;
-    --border: #e4e4e0;
-    --text: #1a1a18;
-    --muted: #8a8a82;
-    --accent: #2563eb;
-    --accent2: #dc2626;
-    --hover: #f0f0ec;
+    --surface-2: #faf9ff;
+    --border: #eceaf7;
+    --text: #1b1b2a;
+    --muted: #8b89a6;
+    --accent: #6336e7;
+    --accent-light: #6f69f7;
+    --accent2: #e5484d;
+    --soft: #efebfd;
+    --hover: #f4f1fd;
+    --grad: linear-gradient(135deg, #6f69f7 0%, #6336e7 100%);
+    --shadow: 0 8px 30px rgba(99,54,231,0.10);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -296,6 +303,119 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     gap: 16px;
   }
 
+  /* ============ Qwen 主题 · 清爽现代 ============ */
+  body {
+    background:
+      radial-gradient(1100px 560px at 100% -12%, rgba(111,105,247,.07), transparent 60%),
+      var(--bg);
+  }
+  /* 复选框统一紫色 */
+  input[type="checkbox"] { accent-color: var(--accent); }
+
+  /* 品牌标识 */
+  .panel-header { padding: 13px 14px 11px; gap: 8px; background: var(--surface); }
+  .brand { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .qwen-mark { flex: none; filter: drop-shadow(0 2px 5px rgba(99,54,231,.28)); }
+  .brand-name { font-size: 14px; font-weight: 700; letter-spacing: .01em; color: var(--text); white-space: nowrap; }
+
+  .list-header { background: var(--surface-2); }
+
+  /* 按钮 */
+  .btn { border-radius: 8px; transition: background .14s, border-color .14s, color .14s; }
+  .btn:hover { background: var(--hover); border-color: #ddd8f3; }
+  .btn.danger:hover { background: #fdecec; border-color: var(--accent2); }
+
+  /* 保存:渐变紫主按钮 */
+  .btn.save {
+    background: var(--grad);
+    border: none;
+    color: #fff;
+    border-radius: 10px;
+    padding: 11px 16px;
+    font-size: 13.5px;
+    letter-spacing: .03em;
+    box-shadow: 0 6px 18px rgba(99,54,231,.30);
+    transition: transform .12s ease, box-shadow .12s ease, filter .12s ease;
+  }
+  .btn.save:hover { background: var(--grad); filter: brightness(1.05); box-shadow: 0 9px 24px rgba(99,54,231,.40); transform: translateY(-1px); }
+  .btn.save:active { transform: translateY(0); box-shadow: 0 4px 12px rgba(99,54,231,.34); }
+
+  /* 字幕项 */
+  .sub-item { border-radius: 10px; }
+  .sub-item:hover { background: var(--hover); }
+  /* 正在播放的当前句:紫色高亮 + 左侧色条 */
+  .sub-item.current { background: var(--soft); box-shadow: inset 3px 0 0 var(--accent); }
+  .sub-item.current .sub-times { color: var(--accent); }
+
+  /* 查找高亮 */
+  .sub-item mark { background: #e7defc; color: var(--accent); }
+
+  /* 编辑聚焦:紫色环 */
+  .sub-text:focus { background: rgba(99,54,231,.06); box-shadow: 0 0 0 2px rgba(99,54,231,.22); }
+
+  /* 图标按钮 */
+  .icon-btn { border-radius: 7px; }
+  .icon-btn:hover { background: var(--soft); color: var(--accent); border-color: #ddd6f6; }
+  .icon-btn.del:hover { background: #fdecec; color: var(--accent2); border-color: var(--accent2); }
+
+  /* 查找框 */
+  .find-bar { background: var(--surface-2); }
+  .find-bar input { background: #fff; border-radius: 7px; }
+  .find-bar input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(99,54,231,.16); }
+
+  /* 滚动条 */
+  .subtitle-list::-webkit-scrollbar-thumb { background: #d9d3f2; }
+  .subtitle-list::-webkit-scrollbar-thumb:hover { background: #c4bbef; }
+
+  /* 右面板柔化 */
+  .list-pane { border-left: 1px solid var(--border); box-shadow: -12px 0 44px rgba(99,54,231,.045); }
+  .panel-footer { background: var(--surface); gap: 9px; }
+
+
+  /* ====== 字幕条目重排:时间移到文字下方 · 更清爽(gemini-designer 建议) ====== */
+  .sub-item {
+    display: grid;
+    grid-template-columns: 16px 1fr auto;
+    grid-template-rows: auto auto;
+    column-gap: 10px;
+    row-gap: 3px;
+    padding: 9px 12px;
+    align-items: start;
+  }
+  /* 复选框:默认隐藏,hover 或选中才显示,降噪 */
+  .sub-check { grid-column: 1; grid-row: 1 / span 2; margin-top: 3px; opacity: 0; transition: opacity .15s ease; }
+  .sub-item:hover .sub-check, .sub-check:checked { opacity: 1; }
+  .sub-text-wrap { grid-column: 2; grid-row: 1; min-width: 0; }
+  .sub-text { line-height: 1.62; color: #16161f; }
+  /* 时间戳:移到文字下方,退居次级 */
+  .sub-times { grid-column: 2; grid-row: 2; min-width: 0; margin-top: 0; font-size: 11px; line-height: 1; letter-spacing: .02em; }
+  .sub-actions { grid-column: 3; grid-row: 1; margin-top: 0; }
+  /* 减图标:去掉冗余的编辑图标(双击文字即可编辑),只留删除 */
+  .sub-actions .icon-btn:not(.del) { display: none; }
+  /* 正在播放:去掉左竖条,改用底色 + 文字提亮表达 */
+  .sub-item.current { background: var(--soft); box-shadow: none; }
+  .sub-item.current .sub-text { color: var(--accent); font-weight: 500; }
+  .sub-item.current .sub-times { color: var(--accent); }
+
+  /* 顶部栏(品牌+全选/删除)默认收起,hover 右侧面板时才浮现 → 更清爽 */
+  .panel-header { max-height: 0; padding-top: 0; padding-bottom: 0; opacity: 0; overflow: hidden;
+    transition: max-height .22s ease, padding .22s ease, opacity .2s ease; }
+  .list-pane:hover .panel-header { max-height: 64px; padding-top: 13px; padding-bottom: 11px; opacity: 1; }
+
+  /* 语言 tab(仅多语言时显示;不换行,横向滚动,隐藏滚动条) */
+  .lang-tabs { display: none; gap: 6px; padding: 9px 12px 0; background: var(--surface); border-bottom: 1px solid var(--border);
+    overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; -ms-overflow-style: none; }
+  .lang-tabs::-webkit-scrollbar { display: none; }
+  .lang-tabs.show { display: flex; }
+  .lang-tab { flex: 0 0 auto; white-space: nowrap; padding: 6px 14px; border-radius: 9px 9px 0 0;
+    border: 1px solid var(--border); border-bottom: none;
+    background: var(--surface-2); color: var(--muted); font-size: 12.5px; font-weight: 600; cursor: pointer; transition: all .15s;
+    display: flex; align-items: center; gap: 5px; }
+  .lang-tab:hover { color: var(--text); }
+  .lang-tab.active { background: var(--grad); color: #fff; border-color: transparent; box-shadow: 0 4px 12px rgba(99,54,231,.28); }
+  .lang-tab .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-light); }
+  .lang-tab.active .dot { background: #fff; }
+
   /* ---- mobile layout: video top, subtitles bottom ---- */
   @media (max-width: 768px) {
     body { height: 100dvh; overflow: hidden; }
@@ -326,10 +446,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- 配音音轨(多语言时按 tab 切换,与视频同步;视频静音) -->
+  <audio id="dubAudio" preload="auto"></audio>
+
   <div class="list-pane" id="listPane">
+    <!-- 语言 tab(仅多语言时显示) -->
+    <div class="lang-tabs" id="langTabs"></div>
+
     <!-- Panel header: title + bulk actions -->
     <div class="panel-header">
-      <span class="panel-title">字幕</span>
+      <span class="brand">
+        <svg class="qwen-mark" viewBox="0 0 24 24" width="22" height="22" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.604 1.34c.393.69.784 1.382 1.174 2.075a.18.18 0 00.157.091h5.552c.174 0 .322.11.446.327l1.454 2.57c.19.337.24.478.024.837-.26.43-.513.864-.76 1.3l-.367.658c-.106.196-.223.28-.04.512l2.652 4.637c.172.301.111.494-.043.77-.437.785-.882 1.564-1.335 2.34-.159.272-.352.375-.68.37-.777-.016-1.552-.01-2.327.016a.099.099 0 00-.081.05 575.097 575.097 0 01-2.705 4.74c-.169.293-.38.363-.725.364-.997.003-2.002.004-3.017.002a.537.537 0 01-.465-.271l-1.335-2.323a.09.09 0 00-.083-.049H4.982c-.285.03-.553-.001-.805-.092l-1.603-2.77a.543.543 0 01-.002-.54l1.207-2.12a.198.198 0 000-.197 550.951 550.951 0 01-1.875-3.272l-.79-1.395c-.16-.31-.173-.496.095-.965.465-.813.927-1.625 1.387-2.436.132-.234.304-.334.584-.335a338.3 338.3 0 012.589-.001.124.124 0 00.107-.063l2.806-4.895a.488.488 0 01.422-.246c.524-.001 1.053 0 1.583-.006L11.704 1c.341-.003.724.032.9.34zm-3.432.403a.06.06 0 00-.052.03L6.254 6.788a.157.157 0 01-.135.078H3.253c-.056 0-.07.025-.041.074l5.81 10.156c.025.042.013.062-.034.063l-2.795.015a.218.218 0 00-.2.116l-1.32 2.31c-.044.078-.021.118.068.118l5.716.008c.046 0 .08.02.104.061l1.403 2.454c.046.081.092.082.139 0l5.006-8.76.783-1.382a.055.055 0 01.096 0l1.424 2.53a.122.122 0 00.107.062l2.763-.02a.04.04 0 00.035-.02.041.041 0 000-.04l-2.9-5.086a.108.108 0 010-.113l.293-.507 1.12-1.977c.024-.041.012-.062-.035-.062H9.2c-.059 0-.073-.026-.043-.077l1.434-2.505a.107.107 0 000-.114L9.225 1.774a.06.06 0 00-.053-.031zm6.29 8.02c.046 0 .058.02.034.06l-.832 1.465-2.613 4.585a.056.056 0 01-.05.029.058.058 0 01-.05-.029L8.498 9.841c-.02-.034-.01-.052.028-.054l.216-.012 6.722-.012z" fill="url(#qwenGrad)" fill-rule="nonzero"></path><defs><linearGradient id="qwenGrad" x1="0%" x2="100%" y1="0%" y2="100%"><stop offset="0%" stop-color="#6F69F7"></stop><stop offset="100%" stop-color="#6336E7"></stop></linearGradient></defs></svg>
+        <span class="brand-name">字幕校对</span>
+      </span>
       <button class="btn" id="btnSelectAll">全选</button>
       <button class="btn danger" id="btnDeleteSelected">删除</button>
     </div>
@@ -367,6 +496,8 @@ let deletedIds = new Set();
 let editMode = null;
 let findIndex = -1;
 let currentNeedle = '';
+let manifest = null;       // 多语言 manifest
+let currentLang = null;    // 当前语言 code
 
 // ── DOM ─────────────────────────────────────────────────────────────────────
 const vid        = document.getElementById('vid');
@@ -379,6 +510,8 @@ const listInfo   = document.getElementById('listInfo');
 const statusTxt  = document.getElementById('statusText');
 const listPane   = document.getElementById('listPane');
 const videoPaneEl = document.getElementById('videoPaneEl');
+const dubAudio   = document.getElementById('dubAudio');
+const langTabs   = document.getElementById('langTabs');
 
 // ── find bar toggle (Ctrl+F) ──────────────────────────────────────────────────
 const findBarEl = document.getElementById('findBar');
@@ -434,42 +567,72 @@ function getVisibleSegments() {
   return segments.filter(s => !deletedIds.has(s._id));
 }
 
-// ── boot ────────────────────────────────────────────────────────────────────
+// ── boot: 读 manifest → 建 tab → 加载默认语言 ───────────────────────────────
 async function init() {
-  const cached = localStorage.getItem(LS_KEY);
-  if (cached) {
-    try {
-      const data = JSON.parse(cached);
-      segments = data.segments || [];
-      deletedIds = new Set(data.deletedIds || []);
-      // If cache has 0 segments it's stale — fall back to server
-      if (segments.length === 0) {
-        localStorage.removeItem(LS_KEY);
-        await loadFromServer();
-      } else {
-        statusTxt.textContent = '已从 localStorage 恢复编辑进度';
-      }
-    } catch {
-      await loadFromServer();
-    }
-  } else {
-    await loadFromServer();
-  }
-  render();
-  updateInfo();
+  manifest = await (await fetch('/manifest')).json();
+  const langs = manifest.languages || [];
+  buildTabs(langs);
+  const src = langs.find(l => l.source) || langs[0];
+  await switchLang(src.code);
 }
 
-async function loadFromServer() {
-  const r = await fetch('/api/transcript');
-  const data = await r.json();
-  segments = data.segments || [];
-  deletedIds = new Set();
+function buildTabs(langs) {
+  if (langs.length <= 1) return;            // 单语言不显示 tab
+  langTabs.classList.add('show');
+  langTabs.innerHTML = '';
+  langs.forEach(L => {
+    const t = document.createElement('div');
+    t.className = 'lang-tab';
+    t.dataset.code = L.code;
+    t.innerHTML = '<span class="dot"></span>' + L.name + (L.audio ? '(配音)' : '');
+    t.addEventListener('click', () => switchLang(L.code));
+    langTabs.appendChild(t);
+  });
 }
+
+async function switchLang(code) {
+  currentLang = code;
+  const L = (manifest.languages || []).find(l => l.code === code) || {};
+  const data = await (await fetch('/api/transcript?lang=' + encodeURIComponent(code))).json();
+  segments = (data.segments || []).map(s => Object.assign({}, s, { _id: Math.random().toString(36).slice(2) }));
+  deletedIds = new Set();
+  editMode = null;
+  document.querySelectorAll('.lang-tab').forEach(t => t.classList.toggle('active', t.dataset.code === code));
+  setAudio(L);
+  render();
+  updateInfo();
+  syncCurSub();   // 立即按当前时间刷新字幕浮层+高亮,不必等播放
+}
+
+// ── 音轨切换:源语言用视频原声;其它语言静音视频 + 播放该语言配音轨(与视频同步) ──
+function setAudio(L) {
+  if (L && L.audio) {
+    vid.muted = true;
+    if (dubAudio.dataset.code !== L.code) {
+      dubAudio.src = '/track/' + L.code;
+      dubAudio.dataset.code = L.code;
+    }
+    dubAudio.currentTime = vid.currentTime;
+    if (!vid.paused) dubAudio.play().catch(() => {});
+  } else {
+    vid.muted = false;
+    dubAudio.pause();
+  }
+}
+
+vid.addEventListener('play', () => {
+  if (vid.muted && dubAudio.src) { dubAudio.currentTime = vid.currentTime; dubAudio.play().catch(() => {}); }
+});
+vid.addEventListener('pause', () => dubAudio.pause());
+vid.addEventListener('ended', () => dubAudio.pause());
+vid.addEventListener('seeking', () => { if (vid.muted && dubAudio.src) dubAudio.currentTime = vid.currentTime; });
+vid.addEventListener('ratechange', () => { dubAudio.playbackRate = vid.playbackRate; });
 
 init();
 
 // ── video sync ─────────────────────────────────────────────────────────────
-vid.addEventListener('timeupdate', () => {
+// 按当前视频时间刷新底部字幕浮层 + 列表高亮(切 tab / 跳转时也能立即生效,不必等播放)
+function syncCurSub(doScroll) {
   const t = vid.currentTime;
   let active = null;
   for (const s of segments) {
@@ -487,8 +650,16 @@ vid.addEventListener('timeupdate', () => {
   document.querySelectorAll('.sub-item').forEach(el => {
     const isActive = active && el.dataset.id == active._id;
     el.classList.toggle('current', !!isActive);
-    if (isActive) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (isActive && doScroll !== false) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   });
+}
+
+vid.addEventListener('timeupdate', () => {
+  // 配音轨漂移校正:与视频时间对不上就拉回
+  if (vid.muted && dubAudio.src && !dubAudio.paused && Math.abs(dubAudio.currentTime - vid.currentTime) > 0.3) {
+    dubAudio.currentTime = vid.currentTime;
+  }
+  syncCurSub();
 });
 
 // ── render ──────────────────────────────────────────────────────────────────
@@ -737,7 +908,7 @@ document.getElementById('btnSave').addEventListener('click', async () => {
   const res = await fetch('/api/transcript', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ segments: toSave })
+    body: JSON.stringify({ segments: toSave, lang: currentLang })
   });
 
   if (!res.ok) {
@@ -780,11 +951,29 @@ document.getElementById('btnSave').addEventListener('click', async () => {
 # ----------------------------------------------------------------------------- #
 # Routes
 # ----------------------------------------------------------------------------- #
+def _lang_transcript_path(lang):
+    """按语言 code 找 transcript 文件;多语言模式从 manifest 解析,否则回退单语言。"""
+    if MANIFEST and lang and lang != "src":
+        for L in MANIFEST.get("languages", []):
+            if L["code"] == lang:
+                return os.path.join(WORKSPACE, L["transcript"])
+    return TRANSCRIPT_PATH
+
+
 @app.route("/")
 def index():
-    cache_key = f"subtitle_editor_v1:{VIDEO_PATH}:{TRANSCRIPT_PATH}"
+    cache_key = f"subtitle_editor_v2:{VIDEO_PATH}:{TRANSCRIPT_PATH}"
     html = HTML_TEMPLATE.replace("__CACHE_KEY__", json.dumps(cache_key))
     return Response(html, content_type="text/html; charset=utf-8")
+
+
+@app.route("/manifest")
+def manifest():
+    if MANIFEST:
+        return jsonify(MANIFEST)
+    # 单语言:合成一个只有一种语言的 manifest,前端逻辑统一
+    return jsonify({"video": "/video", "languages": [
+        {"code": "src", "name": "字幕", "transcript": "src", "source": True}]})
 
 
 @app.route("/video")
@@ -794,18 +983,27 @@ def video():
     return send_file(VIDEO_PATH, mimetype="video/mp4")
 
 
+@app.route("/track/<code>")
+def track(code):
+    """某语言的配音音轨。"""
+    if MANIFEST:
+        for L in MANIFEST.get("languages", []):
+            if L["code"] == code and L.get("audio"):
+                p = os.path.join(WORKSPACE, L["audio"])
+                if os.path.exists(p):
+                    return send_file(p, mimetype="audio/mp4")
+    return "no track", 404
+
+
 @app.route("/api/transcript", methods=["GET"])
 def get_transcript():
-    # Use parse_constant=None to handle NaN/Infinity from Whisper output
-    with open(TRANSCRIPT_PATH, encoding="utf-8") as f:
+    path = _lang_transcript_path(request.args.get("lang"))
+    with open(path, encoding="utf-8") as f:
         raw = f.read()
-    import math, re as _re
-    # Replace bare NaN/Infinity tokens (not valid JSON) with null
+    import re as _re
     raw = _re.sub(r'\bNaN\b', 'null', raw)
-    raw = _re.sub(r'\bInfinity\b', 'null', raw)
-    raw = _re.sub(r'\b-Infinity\b', 'null', raw)
+    raw = _re.sub(r'\b-?Infinity\b', 'null', raw)
     data = json.loads(raw)
-    # Support both {"segments": [...]} and plain [...]
     segs = data.get("segments", data) if isinstance(data, dict) else data
     return jsonify({"segments": segs})
 
@@ -813,9 +1011,9 @@ def get_transcript():
 @app.route("/api/transcript", methods=["POST"])
 def post_transcript():
     body = request.get_json()
-    output = {"segments": body["segments"]}
-    with open(TRANSCRIPT_PATH, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+    path = _lang_transcript_path(body.get("lang") or request.args.get("lang"))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"segments": body["segments"]}, f, ensure_ascii=False, indent=2)
     RESULT_DONE.set()
     return jsonify({"ok": True})
 
@@ -824,30 +1022,37 @@ def post_transcript():
 # Main
 # ----------------------------------------------------------------------------- #
 def main():
-    global VIDEO_PATH, TRANSCRIPT_PATH
+    global VIDEO_PATH, TRANSCRIPT_PATH, MANIFEST, WORKSPACE
 
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("Usage: preview_editor.py <video.mp4> <transcript.json>")
+        print("   or: preview_editor.py <manifest.json>   # 多语言模式")
         sys.exit(1)
 
-    VIDEO_PATH      = os.path.abspath(sys.argv[1])
-    TRANSCRIPT_PATH = os.path.abspath(sys.argv[2])
-
-    for p in [VIDEO_PATH, TRANSCRIPT_PATH]:
-        if not Path(p).exists():
-            print(f"❌ File not found: {p}")
+    a1 = os.path.abspath(sys.argv[1])
+    if a1.endswith("manifest.json") and len(sys.argv) == 2:
+        # 多语言:manifest 模式
+        WORKSPACE = os.path.dirname(a1)
+        MANIFEST = json.load(open(a1, encoding="utf-8"))
+        VIDEO_PATH = os.path.join(WORKSPACE, MANIFEST["video"])
+        src = next((L for L in MANIFEST["languages"] if L.get("source")), MANIFEST["languages"][0])
+        TRANSCRIPT_PATH = os.path.join(WORKSPACE, src["transcript"])
+    else:
+        if len(sys.argv) < 3:
+            print("Usage: preview_editor.py <video.mp4> <transcript.json>")
             sys.exit(1)
+        VIDEO_PATH = a1
+        TRANSCRIPT_PATH = os.path.abspath(sys.argv[2])
 
-    # Save pre-edit snapshot for Claude to diff after the session
+    if not Path(VIDEO_PATH).exists():
+        print(f"❌ File not found: {VIDEO_PATH}")
+        sys.exit(1)
+
     import shutil
-    orig_backup = TRANSCRIPT_PATH + ".orig.json"
-    shutil.copy2(TRANSCRIPT_PATH, orig_backup)
-    print(f"[preview] Snapshot saved: {orig_backup}")
-
+    shutil.copy2(TRANSCRIPT_PATH, TRANSCRIPT_PATH + ".orig.json")
     print(f"[preview] Video:     {VIDEO_PATH}")
-    print(f"[preview] Transcript: {TRANSCRIPT_PATH}")
+    print(f"[preview] {'Manifest: ' + a1 if MANIFEST else 'Transcript: ' + TRANSCRIPT_PATH}")
     print(f"[preview] Flask running on http://localhost:{PORT}")
-    print(f"[preview] Agent 将创建交互页包装器在 Oil 内置浏览器中打开")
 
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     print("[preview] Exiting.")
