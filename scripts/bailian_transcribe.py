@@ -851,19 +851,25 @@ def transcribe_file(
     cleaned_segments, removed_fillers = (
         _clean_fillers(raw_segments) if clean_fillers else (raw_segments, 0)
     )
-    llm_segments = None
-    if split_mode == "llm":
-        log(f"Splitting subtitles with {split_model}...")
-        llm_segments = _llm_segment(cleaned_segments, model=split_model)
-        if llm_segments is None:
-            log("Falling back to rule-based subtitle splitting.")
-    base_segments = llm_segments if llm_segments else cleaned_segments
-    # _shorten_segments enforces the hard width/duration caps; on LLM output it
-    # only touches lines that exceed them. The merge pass then absorbs
-    # too-short fragments, mirroring the burn-time merge.
-    segments = _clean_segment_display_text(
-        _merge_short_segments(_shorten_segments(base_segments))
-    )
+    if split_mode == "raw":
+        # Editing needs the original ASR sentence structure, punctuation and
+        # every word token. Subtitle cleanup would destroy evidence used to
+        # find fillers, false starts and repeated takes.
+        segments = cleaned_segments
+    else:
+        llm_segments = None
+        if split_mode == "llm":
+            log(f"Splitting subtitles with {split_model}...")
+            llm_segments = _llm_segment(cleaned_segments, model=split_model)
+            if llm_segments is None:
+                log("Falling back to rule-based subtitle splitting.")
+        base_segments = llm_segments if llm_segments else cleaned_segments
+        # _shorten_segments enforces the hard width/duration caps; on LLM output it
+        # only touches lines that exceed them. The merge pass then absorbs
+        # too-short fragments, mirroring the burn-time merge.
+        segments = _clean_segment_display_text(
+            _merge_short_segments(_shorten_segments(base_segments))
+        )
     glossary_hits = 0
     if apply_glossary:
         segments, glossary_hits = _apply_glossary(segments)
@@ -892,9 +898,10 @@ def main():
                         help="Use a specific Bailian hot-word vocabulary ID instead of the managed one.")
     parser.add_argument("--no-glossary", action="store_true",
                         help="Do not apply glossary.json corrections to the transcript text.")
-    parser.add_argument("--split-mode", choices=["llm", "rules"], default="llm",
+    parser.add_argument("--split-mode", choices=["llm", "rules", "raw"], default="llm",
                         help="Subtitle line splitting: 'llm' (default, phrase-aware via Qwen with "
-                             "rule fallback) or 'rules' (token scoring only).")
+                             "rule fallback), 'rules' (token scoring only), or 'raw' "
+                             "(editing analysis with original ASR sentences).")
     parser.add_argument("--split-model", default=SPLIT_LLM_MODEL,
                         help=f"Chat model for LLM splitting (default: {SPLIT_LLM_MODEL}).")
     args = parser.parse_args()

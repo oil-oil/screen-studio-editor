@@ -59,7 +59,9 @@ If the user did not specify settings, use:
 - `--asr-backend bailian`
 - `--language zh` for Chinese/Mandarin content
 
-### 2. Run the editor
+### 2. Analyze first, then run the editor
+
+Start with a dry run. It performs the complete ASR/audio/activity/candidate analysis, writes an audit report, and does not modify `project.json` or create a backup:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
@@ -68,15 +70,30 @@ If the user did not specify settings, use:
   --min-pause 300 \
   --pause-source silence \
   --asr-backend bailian \
-  --language zh
+  --language zh \
+  --dry-run \
+  --report-output "/tmp/screenstudio-autoedit-report.json"
 ```
 
-If `transcript.json` already exists and you want to reuse the existing transcription:
+Read the audit report yourself. Check every protected interval, every reviewed cut, all removals over 5 seconds, and whether the projected time saved is plausible. A first dry run caches its source-time editing transcript beside the report (the exact path is in `edit_transcript_cache`), so reuse it and avoid paying for ASR twice. Then run without `--dry-run`:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/path/to/Project.screenstudio/transcript.json" \
+  --skip-transcribe "/tmp/screenstudio-autoedit-report.transcript.edit.json" \
+  --pause-threshold 800 \
+  --min-pause 300 \
+  --pause-source silence \
+  --asr-backend bailian \
+  --language zh
+```
+
+If `transcript.edit.json` already exists and you want to reuse the existing editing transcription:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/process.py" \
+  --project "/path/to/Project.screenstudio" \
+  --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
   --pause-threshold 800 \
   --min-pause 300 \
   --pause-source silence \
@@ -86,48 +103,64 @@ If `transcript.json` already exists and you want to reuse the existing transcrip
 
 **Notes on `process.py`:**
 
+- Every normal run writes `autoedit-report.json` beside the project. Use it to diagnose a missed/protected cut before changing thresholds.
 - On the first run it backs up `project.json` to `project.json.bak` and re-applies edits from that backup, so runs are idempotent — re-run with `--cuts-file` to add repeat cuts without stacking them on already-cut slices.
 - If `project.json` was changed externally since the last run (edited **or just re-saved** in Screen Studio), the script protects those changes: a re-run with `--cuts-file` applies the new cuts **incrementally to the current timeline** (external edits preserved, no ASR needed); a full re-run refuses and requires `--discard-external-edits` to intentionally start over from the backup. Do not pass `--discard-external-edits` without telling the user their Screen Studio adjustments will be lost.
-- `process.py` uses Bailian FunAudio ASR by default and saves the raw ASR response as `bailian_asr.json`. Bailian `speech recognize` has hot-word vocabulary support but no free prompt for style instructions, so standalone fillers such as `呃` / `嗯` / `啊` are removed by `bailian_transcribe.py` after ASR. The old local Whisper path is only for explicit comparison or emergency fallback via `--asr-backend local`; do not use it silently. If Bailian fails twice, the script continues with **silence-only editing** (no transcript.json, no repeat review) and says so — mention this to the user and offer to re-run transcription later.
-- Pause cuts come from **measured silence**, not ASR word timestamps — ASR word boundaries can drift, so silence is the reliable cut source; ASR stays an opt-in fallback via `--pause-source`. The silence threshold defaults to `auto` (derived from the recording's measured level — the safe choice across varied mics). Only pass a fixed `--silence-db` when auto misbehaves: **lower** toward `-35` if speech gets clipped, **raise** toward `-20` if pauses are left uncut. `--silence-min-dur` (default 0.3s) is the shortest silence considered.
+- `process.py` uses Bailian FunAudio ASR by default and saves three artifacts: untouched provider output in `bailian_asr.json`, a **source-time editing transcript** in `transcript.edit.json`, and the compatibility copy `transcript.json`. Editing transcripts preserve standalone fillers, word timestamps, punctuation, and raw ASR sentence boundaries — subtitle cleanup must never run before edit-candidate review. The old local Whisper path is only for explicit comparison or emergency fallback via `--asr-backend local`; do not use it silently. If Bailian fails twice, the script continues with audio-only editing and says so.
+- Pause candidates combine **per-session adaptive energy silence** with local **Silero VAD**. VAD catches non-speech gaps that contain fan noise or keyboard sounds; ASR word protection prevents recognized speech from being cut. Screen activity protection is also on by default: click/keystroke files and a low-resolution display-change scan keep silent tutorial actions. Do not pass `--no-vad`, `--no-visual-scan`, or `--no-screen-activity-protection` unless diagnosing a specific failure.
+- The silence threshold defaults to `auto`, estimated separately for every recording session from short-window noise/speech percentiles. Only pass a fixed `--silence-db` when auto misbehaves: lower toward `-35` if speech gets clipped, or raise toward `-20` if pauses remain. `--silence-min-dur` (default 0.3s) is the shortest audio-inactivity region considered.
 - Multi-session recordings (pausing/resuming while recording) are handled: each session's audio runs slightly longer than its slot in the slice timeline, and the script re-anchors ASR and silence timestamps per session. `transcript.json` is saved in **slice-timeline coordinates**, so `start`/`end` values from it can be copied into `cuts.json` as `start_ms`/`end_ms` (×1000) directly.
-- A pause cut never removes anything ASR recognized as a word (word protection). Repeat cuts from `--cuts-file` are exempt — removing recognized speech is their purpose.
+- A pause cut never removes anything ASR recognized as a word. Reviewed filler/repeat cuts use nearby low-energy waveform points for their final splice boundaries; do not add fixed inward padding to ASR timestamps.
+- New cuts files are schema-v2 objects declaring `coordinate_space` (`source` or `edited`) and a `project_sha256`. `process.py` maps edited/export-time cuts through the exact current `slices` map and refuses mismatched project fingerprints. Legacy list-only cuts are accepted as source time with a warning.
 
 ### 3. Review repeated narration
 
-Read `transcript.json` yourself. Do not ask the user to mark obvious repeats.
+Read `transcript.edit.json` yourself. Do not ask the user to mark obvious repeats.
 
 Optional Gemini-assisted review:
 
 - Use Gemini to review edit candidates, not to edit the `.screenstudio` project directly.
 - Prefer this when the video has filler words, false starts, or repeated takes that silence detection cannot remove.
-- If you have an exported video, pass it so Gemini can inspect frames around each candidate. Without video, it will use transcript context only and should stay conservative.
-- For filler-word tests, first generate a review transcript with `bailian_transcribe.py --keep-fillers`; the normal subtitle transcript intentionally removes standalone fillers.
+- Candidate search scans the complete timeline, including multi-sentence repeats up to 60 seconds apart; it then balances candidates across the recording and reviews them in batches. Do not restore a chronological “first N” cap.
+- If `GEMINI_API_KEY` is available and `--video` is provided, the reviewer sends short clips with audio to the native Gemini API. Otherwise it falls back to ZenMux plus still frames. Model output remains advisory: timeline validation, input/display protection, and waveform boundary refinement run locally.
 
-```bash
-"$PYTHON" "$BAILIAN_TRANSCRIBE" \
-  "/path/to/exported_or_source.mp4" \
-  --output "/tmp/transcript.keep_fillers.json" \
-  --language zh \
-  --keep-fillers
-```
+For a source-time editing transcript, review without an exported video (or pass a source-time proxy video if one exists):
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/gemini_edit_candidates.py" \
-  --transcript "/tmp/transcript.keep_fillers.json" \
-  --video "/path/to/exported_or_source.mp4" \
+  --transcript "/path/to/Project.screenstudio/transcript.edit.json" \
+  --coordinate-space source \
+  --project-json "/path/to/Project.screenstudio/project.json" \
   --output "/tmp/gemini_edit_report.json" \
   --cuts-output "/tmp/gemini_cuts.json"
 ```
 
-If only `transcript.json` exists, you may pass it, but filler-word detection will be weaker because the normal transcript was already cleaned.
+For an **exported edited video**, transcribe that export in raw editing mode and explicitly mark the result as edited time. Never label exported timestamps as source time:
+
+```bash
+"$PYTHON" "$BAILIAN_TRANSCRIBE" \
+  "/path/to/exported_edited.mp4" \
+  --output "/tmp/exported.edit.json" \
+  --language zh \
+  --keep-fillers \
+  --no-glossary \
+  --split-mode raw
+
+"$PYTHON" "$SKILL_DIR/scripts/gemini_edit_candidates.py" \
+  --transcript "/tmp/exported.edit.json" \
+  --video "/path/to/exported_edited.mp4" \
+  --coordinate-space edited \
+  --project-json "/path/to/Project.screenstudio/project.json" \
+  --output "/tmp/gemini_edit_report.json" \
+  --cuts-output "/tmp/gemini_cuts.json"
+```
 
 Apply high-confidence Gemini cuts through the existing timeline editor:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/path/to/Project.screenstudio/transcript.json" \
+  --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
   --cuts-file "/tmp/gemini_cuts.json" \
   --pause-threshold 800 \
   --min-pause 300 \
@@ -157,19 +190,24 @@ mkdir -p /tmp/repeat_frames
 ffmpeg -i "/path/to/video_or_export.mp4" -ss 42 -t 12 -vf "fps=1" /tmp/repeat_frames/frame_%04d.jpg -y
 ```
 
-Write repeat cuts to `/tmp/cuts.json`:
+Write manual repeat cuts as a schema-v2 `/tmp/cuts.json` document. Use `source` only for timestamps copied from `transcript.edit.json`; edited/export timestamps require the matching current-project SHA and should normally be produced by `gemini_edit_candidates.py`:
 
 ```json
-[
-  {
-    "start_ms": 123000,
-    "end_ms": 131500,
-    "removed_text": "repeated or abandoned phrase",
-    "reason": "false_start",
-    "confidence": "high",
-    "kept_text": "cleaner take"
-  }
-]
+{
+  "schema_version": 2,
+  "coordinate_space": "source",
+  "project_sha256": null,
+  "cuts": [
+    {
+      "start_ms": 123000,
+      "end_ms": 131500,
+      "removed_text": "repeated or abandoned phrase",
+      "reason": "false_start",
+      "confidence": "high",
+      "kept_text": "cleaner take"
+    }
+  ]
+}
 ```
 
 Apply them:
@@ -177,7 +215,7 @@ Apply them:
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/path/to/Project.screenstudio/transcript.json" \
+  --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
   --cuts-file "/tmp/cuts.json" \
   --pause-threshold 800 \
   --min-pause 300 \
@@ -221,6 +259,7 @@ Accuracy and segmentation are layered — all on by default, each with an opt-ou
 - **Hot words** (`hotwords.json` → Bailian vocabulary, `--no-hotwords` to disable): steers recognition toward the channel's recurring proper nouns. Add a term when ASR keeps mishearing it; do NOT add well-known words ASR already gets right (a hot word can hijack similar-sounding speech — 飞书 as a hot word turned "Fable" into 飞书). The vocabulary is cached in `.vocabulary-cache.json` and auto-updates when `hotwords.json` changes.
 - **Glossary auto-apply** (`glossary.json`, `--no-glossary` to disable): recurring text corrections applied to segment text right after ASR, so the preview shows corrected subtitles. Matching is case-insensitive and whitespace-tolerant. The same replacements run again at burn time (idempotent).
 - **LLM line splitting** (`--split-mode llm` default, `rules` to disable; `--split-model` to override): over-long ASR sentences are split into subtitle lines by Qwen, sentence by sentence in parallel — the LLM only chooses break points; character content is validated and any failed sentence falls back to the rule splitter. Expect a handful of "LLM split modified the text" warnings on stuttery sentences; that is the validation working, not an error.
+- `--split-mode raw` is for editing analysis only. It preserves punctuation, fillers, and ASR sentence boundaries and must not be sent directly to the subtitle preview/burn workflow.
 
 If the user explicitly asks to compare with the old local model or Bailian is temporarily unavailable, the existing local transcription path is still available:
 

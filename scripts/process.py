@@ -7,19 +7,30 @@ here; burned subtitles are produced separately by burn_subtitles.py (Mode B).
 """
 
 import argparse
-import hashlib
+import array
 import json
+import math
 import random
+import re
 import shutil
 import string
 import subprocess
 import sys
 import tempfile
+import wave
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+
+from editing_core import (
+    CutsValidationError,
+    file_sha256,
+    load_cuts_document,
+    merge_intervals,
+    protect_cuts_with_activity,
+)
 
 
 def log(msg):
@@ -28,7 +39,7 @@ def log(msg):
 
 def _file_sha256(path: Path) -> str:
     """Hash a file's bytes — used to detect external edits between runs."""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return file_sha256(path)
 
 
 def backup_project(project_json_path: Path):
@@ -61,6 +72,174 @@ def get_mic_sessions(metadata: dict) -> list[dict]:
                 for s in recorder.get("sessions", []):
                     sessions.append(s)
     return sorted(sessions, key=lambda s: s["processTimeStartMs"])
+
+
+def get_recorder_sessions(metadata: dict, recorder_type: str) -> list[dict]:
+    sessions = []
+    for recorder in metadata.get("recorders", []):
+        if recorder.get("type") == recorder_type or recorder_type in str(recorder.get("id", "")):
+            sessions.extend(recorder.get("sessions", []))
+    return sorted(sessions, key=lambda session: session.get("processTimeStartMs", 0))
+
+
+def timeline_offset_for_process_time(process_time_ms: float, session_offsets: list[dict]) -> float:
+    """Anchor an input/display event to the microphone-derived source timeline."""
+    if not session_offsets:
+        return max(0.0, process_time_ms)
+    session = min(
+        session_offsets,
+        key=lambda item: abs(float(item.get("processTimeStartMs", 0)) - process_time_ms),
+    )
+    return float(session["timelineOffsetMs"]) + max(
+        0.0, process_time_ms - float(session.get("processTimeStartMs", process_time_ms))
+    )
+
+
+_EVENT_TIME_KEYS = (
+    "processtimems", "processtime", "process_time_ms", "process_time",
+    "timestampms", "timestamp", "timems", "time_ms", "offsetms", "offset_ms", "time",
+    "unixms", "unixtime", "unix_time_ms",
+)
+
+
+def _walk_event_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_event_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_event_dicts(child)
+
+
+def _event_relative_ms(key: str, value: float, session: dict) -> float | None:
+    key_norm = key.lower().replace("-", "_")
+    duration_ms = float(session.get("durationMs", 0) or 0)
+    process_start = float(session.get("processTimeStartMs", 0) or 0)
+    unix_start = float(session.get("unixStartMs", 0) or 0)
+    if "unix" in key_norm or value > 100_000_000_000:
+        return value - unix_start if unix_start else None
+    if "process" in key_norm:
+        return value - process_start if process_start and value >= process_start else value
+    if process_start and value >= process_start - 1000 and value <= process_start + duration_ms + 5000:
+        return value - process_start
+    # Decimal values that fit the session in seconds are overwhelmingly seconds.
+    if duration_ms and value <= duration_ms / 1000.0 + 5 and not float(value).is_integer():
+        return value * 1000.0
+    return value
+
+
+def load_input_activity_intervals(
+    project_dir: Path,
+    metadata: dict,
+    session_offsets: list[dict],
+    *,
+    pad_ms: float = 850.0,
+) -> list[tuple[float, float]]:
+    """Read keyboard/click event files and return protected source-time ranges.
+
+    Mouse-move streams are intentionally ignored: normal cursor travel would
+    protect nearly the whole recording.  Clicks and keystrokes are strong
+    evidence that a silent interval contains an intentional tutorial action.
+    """
+    input_sessions = get_recorder_sessions(metadata, "input")
+    recording_dir = project_dir / "recording"
+    intervals: list[tuple[float, float]] = []
+    loaded_files: set[Path] = set()
+    for index, session in enumerate(input_sessions):
+        candidates: list[Path] = []
+        for key in ("mouseClicksFilename", "keyStrokesFilename", "keystrokesFilename"):
+            if session.get(key):
+                candidates.append(recording_dir / str(session[key]))
+        candidates.extend([
+            recording_dir / f"mouseclicks-{index}.json",
+            recording_dir / f"keystrokes-{index}.json",
+        ])
+        source_anchor = timeline_offset_for_process_time(
+            float(session.get("processTimeStartMs", 0)), session_offsets
+        )
+        for path in candidates:
+            if path in loaded_files or not path.exists():
+                continue
+            loaded_files.add(path)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                log(f"⚠️  Could not parse input activity {path.name}: {exc}")
+                continue
+            file_events = 0
+            for event in _walk_event_dicts(payload):
+                normalized = {str(key).lower().replace("-", "_"): (key, value) for key, value in event.items()}
+                chosen = None
+                for wanted in _EVENT_TIME_KEYS:
+                    normalized_wanted = wanted.lower().replace("-", "_")
+                    if normalized_wanted in normalized:
+                        chosen = normalized[normalized_wanted]
+                        break
+                if chosen is None:
+                    continue
+                raw_key, raw_value = chosen
+                if not isinstance(raw_value, (int, float)):
+                    continue
+                relative_ms = _event_relative_ms(str(raw_key), float(raw_value), session)
+                if relative_ms is None or relative_ms < -1000:
+                    continue
+                event_ms = source_anchor + max(0.0, relative_ms)
+                intervals.append((max(0.0, event_ms - pad_ms), event_ms + pad_ms))
+                file_events += 1
+            if file_events:
+                log(f"⌨️  Protected {file_events} click/keystroke event(s) from {path.name}.")
+    return merge_intervals(intervals, gap_ms=120.0)
+
+
+def _display_source_path(project_dir: Path, session: dict) -> Path | None:
+    recording_dir = project_dir / "recording"
+    filename = str(session.get("outputFilename") or "")
+    if filename:
+        direct = recording_dir / filename
+        if direct.exists():
+            return direct
+        playlist = direct.with_suffix(".m3u8")
+        if playlist.exists():
+            return playlist
+    return None
+
+
+def detect_visual_activity_intervals(
+    project_dir: Path,
+    metadata: dict,
+    session_offsets: list[dict],
+    *,
+    fps: float = 2.5,
+    scene_threshold: float = 0.012,
+    pad_ms: float = 900.0,
+) -> list[tuple[float, float]]:
+    """Detect meaningful display changes with a low-resolution ffmpeg scan."""
+    display_sessions = get_recorder_sessions(metadata, "display")
+    intervals: list[tuple[float, float]] = []
+    for index, session in enumerate(display_sessions):
+        source = _display_source_path(project_dir, session)
+        if source is None:
+            continue
+        process_start = float(session.get("processTimeStartMs", 0))
+        source_anchor = timeline_offset_for_process_time(process_start, session_offsets)
+        vf = f"fps={fps},scale=320:-2,select='gt(scene,{scene_threshold})',showinfo"
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "info", "-i", str(source),
+             "-vf", vf, "-an", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            log(f"⚠️  Visual activity scan failed for display session {index}; input-event protection remains active.")
+            continue
+        found = 0
+        for match in re.finditer(r"pts_time:([0-9.]+)", result.stderr):
+            event_ms = source_anchor + float(match.group(1)) * 1000.0
+            intervals.append((max(0.0, event_ms - pad_ms), event_ms + pad_ms))
+            found += 1
+        if found:
+            log(f"🖥️  Protected {found} display-change event(s) in session {index}.")
+    return merge_intervals(intervals, gap_ms=150.0)
 
 
 def _probe_duration_ms(path: Path) -> float | None:
@@ -184,13 +363,16 @@ def transcribe(
     """
     lang_display = language if language else "auto-detect"
     if backend == "bailian":
-        log(f"🎙️  Transcribing with Bailian FunAudio ASR (language={lang_display})...")
+        log(f"🎙️  Transcribing edit transcript with Bailian FunAudio ASR (language={lang_display})...")
         from bailian_transcribe import transcribe_file
 
         segments = transcribe_file(
             audio_path,
             language=language,
             raw_output_path=raw_output_path,
+            clean_fillers=False,
+            apply_glossary=False,
+            split_mode="raw",
         )
     elif backend == "local":
         log(f"🎙️  Transcribing locally (language={lang_display})...")
@@ -223,6 +405,139 @@ def map_audio_time_to_timeline_ms(audio_offset_s: float, session_offsets: list[d
             delta = min(u - s["audioOffsetMs"], s["durationMs"])
             return s["timelineOffsetMs"] + delta
     return u
+
+
+def map_timeline_time_to_audio_ms(timeline_ms: float, session_offsets: list[dict]) -> float:
+    """Inverse of ``map_audio_time_to_timeline_ms`` inside a recording session."""
+    for session in reversed(session_offsets):
+        start = float(session["timelineOffsetMs"])
+        end = start + float(session["durationMs"])
+        if start <= timeline_ms <= end:
+            return float(session["audioOffsetMs"]) + min(max(0.0, timeline_ms - start), float(session["durationMs"]))
+    return max(0.0, timeline_ms)
+
+
+class WaveformQuietPointFinder:
+    """Find low-energy edit points in the already-decoded 16 kHz mono WAV."""
+
+    def __init__(self, path: Path):
+        with wave.open(str(path), "rb") as handle:
+            if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
+                raise RuntimeError("boundary refinement requires a mono 16-bit PCM WAV")
+            self.sample_rate = handle.getframerate()
+            samples = array.array("h")
+            samples.frombytes(handle.readframes(handle.getnframes()))
+        if sys.byteorder != "little":
+            samples.byteswap()
+        self.samples = samples
+
+    def rms_at_ms(self, audio_ms: float, window_ms: float = 24.0) -> float:
+        center = int(audio_ms * self.sample_rate / 1000.0)
+        radius = max(1, int(window_ms * self.sample_rate / 2000.0))
+        start = max(0, center - radius)
+        end = min(len(self.samples), center + radius)
+        if end <= start:
+            return float("inf")
+        return math.sqrt(sum(sample * sample for sample in self.samples[start:end]) / (end - start))
+
+    def quietest_timeline_ms(
+        self,
+        start_ms: float,
+        end_ms: float,
+        session_offsets: list[dict],
+        *,
+        step_ms: float = 8.0,
+    ) -> float | None:
+        if end_ms <= start_ms:
+            return None
+        best: tuple[float, float, float] | None = None
+        midpoint = (start_ms + end_ms) / 2.0
+        point = start_ms
+        while point <= end_ms + 0.01:
+            audio_ms = map_timeline_time_to_audio_ms(point, session_offsets)
+            score = self.rms_at_ms(audio_ms)
+            candidate = (score, abs(point - midpoint), point)
+            if best is None or candidate < best:
+                best = candidate
+            point += step_ms
+        return best[2] if best else None
+
+
+def refine_repeat_cut_boundaries(
+    cuts: list[dict],
+    words: list[dict],
+    audio_path: Path,
+    session_offsets: list[dict],
+    *,
+    search_ms: float = 240.0,
+    speech_guard_ms: float = 35.0,
+) -> list[dict]:
+    """Place semantic cuts in nearby quiet gaps without clipping removed words.
+
+    ASR/model ranges describe *what* should disappear; waveform minima decide
+    where the splice should land.  Unlike the old fixed inward 150 ms padding,
+    this keeps the whole filler/repeated phrase while protecting its neighbours.
+    """
+    if not cuts:
+        return []
+    try:
+        quiet = WaveformQuietPointFinder(audio_path)
+    except Exception as exc:
+        log(f"⚠️  Could not load waveform for boundary refinement: {exc}; keeping reviewed boundaries.")
+        return cuts
+
+    ordered_words = [
+        w for w in words
+        if w.get("start") is not None and w.get("end") is not None
+    ]
+    refined: list[dict] = []
+    for cut in cuts:
+        start_ms = float(cut["start_ms"])
+        end_ms = float(cut["end_ms"])
+        overlapping_indices = [
+            index for index, word in enumerate(ordered_words)
+            if float(word["end"]) * 1000.0 > start_ms
+            and float(word["start"]) * 1000.0 < end_ms
+        ]
+        if overlapping_indices:
+            first = overlapping_indices[0]
+            last = overlapping_indices[-1]
+            first_start = float(ordered_words[first]["start"]) * 1000.0
+            last_end = float(ordered_words[last]["end"]) * 1000.0
+            previous_end = (
+                float(ordered_words[first - 1]["end"]) * 1000.0 + speech_guard_ms
+                if first > 0 else max(0.0, first_start - search_ms)
+            )
+            next_start = (
+                float(ordered_words[last + 1]["start"]) * 1000.0 - speech_guard_ms
+                if last + 1 < len(ordered_words) else last_end + search_ms
+            )
+            start_window = (
+                max(0.0, previous_end, first_start - search_ms),
+                max(0.0, first_start - speech_guard_ms),
+            )
+            end_window = (
+                last_end + speech_guard_ms,
+                min(next_start, last_end + search_ms),
+            )
+        else:
+            start_window = (max(0.0, start_ms - search_ms), start_ms + search_ms)
+            end_window = (max(start_ms, end_ms - search_ms), end_ms + search_ms)
+
+        new_start = quiet.quietest_timeline_ms(*start_window, session_offsets) or start_ms
+        new_end = quiet.quietest_timeline_ms(*end_window, session_offsets) or end_ms
+        if new_end - new_start < 120.0:
+            log(f"⚠️  Unsafe refined cut skipped: {start_ms/1000:.2f}s→{end_ms/1000:.2f}s")
+            continue
+        refined.append({
+            **cut,
+            "start_ms": new_start,
+            "end_ms": new_end,
+            "reviewed_start_ms": start_ms,
+            "reviewed_end_ms": end_ms,
+            "boundary_refined": True,
+        })
+    return refined
 
 
 def remap_segments_to_timeline(segments: list[dict], session_offsets: list[dict]) -> list[dict]:
@@ -474,21 +789,62 @@ def measure_audio_levels(audio_path: Path) -> tuple[float | None, float | None]:
     return mean_db, max_db
 
 
-def resolve_silence_db(requested: str, mean_db: float | None) -> float:
+def measure_energy_percentiles(audio_path: Path) -> tuple[float | None, float | None]:
+    """Estimate (noise_floor, speech_level) from short-window RMS percentiles."""
+    try:
+        with wave.open(str(audio_path), "rb") as handle:
+            if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
+                return None, None
+            sample_rate = handle.getframerate()
+            samples = array.array("h")
+            samples.frombytes(handle.readframes(handle.getnframes()))
+        if sys.byteorder != "little":
+            samples.byteswap()
+        window = max(1, int(sample_rate * 0.025))
+        step = max(window, int(sample_rate * 0.12))
+        levels = []
+        for start in range(0, max(0, len(samples) - window), step):
+            chunk = samples[start:start + window]
+            rms = math.sqrt(sum(value * value for value in chunk) / max(1, len(chunk)))
+            levels.append(20.0 * math.log10(max(rms, 1.0) / 32768.0))
+        if not levels:
+            return None, None
+        levels.sort()
+        percentile = lambda ratio: levels[min(len(levels) - 1, int((len(levels) - 1) * ratio))]
+        return percentile(0.2), percentile(0.8)
+    except Exception:
+        return None, None
+
+
+def resolve_silence_db(
+    requested: str,
+    mean_db: float | None,
+    noise_floor_db: float | None = None,
+    speech_level_db: float | None = None,
+) -> float:
     """
     Resolve the --silence-db option to a concrete dB threshold.
 
     A fixed dB threshold can't fit every recording: too high clips quiet speech,
     too low leaves hiss. 'auto' derives it from the measured mean level (10 dB
     below average, clamped to a sane range) so it adapts to each mic's noise
-    floor — the documented best practice for silence detection.
+    floor.  Prefer short-window energy percentiles over a whole-file mean:
+    recordings with lots of dead air otherwise push the threshold too low.
     """
     if str(requested).strip().lower() == "auto":
+        if noise_floor_db is not None and speech_level_db is not None and speech_level_db > noise_floor_db:
+            derived = noise_floor_db + 0.45 * (speech_level_db - noise_floor_db)
+            derived = max(-45.0, min(-18.0, round(derived, 1)))
+            log(
+                f"🎚️  Adaptive silence threshold: {derived} dB "
+                f"(noise p20 {noise_floor_db:.1f}, speech p80 {speech_level_db:.1f} dBFS)."
+            )
+            return derived
         if mean_db is None:
             log("⚠️  Could not measure audio level for --silence-db auto; falling back to -28 dB.")
             return -28.0
         derived = max(-45.0, min(-18.0, round(mean_db - 10.0, 1)))
-        log(f"🎚️  Adaptive silence threshold: {derived} dB (mean {mean_db:.1f} dBFS − 10).")
+        log(f"🎚️  Adaptive silence threshold: {derived} dB (mean fallback {mean_db:.1f} dBFS − 10).")
         return derived
     return float(requested)
 
@@ -530,6 +886,106 @@ def detect_silence_regions(audio_path: Path, noise_db: float = -28.0, min_dur: f
 
     log(f"🔇 silencedetect ({noise_db}dB, min {min_dur}s): found {len(regions)} region(s).")
     return regions
+
+
+_SILERO_MODEL = None
+
+
+def detect_nonspeech_regions_vad(
+    audio_path: Path,
+    *,
+    min_dur: float = 0.3,
+    threshold: float = 0.5,
+) -> list[tuple[float, float]]:
+    """Return non-speech intervals using local Silero VAD.
+
+    This complements amplitude silence: keyboard clicks, fan noise and room
+    hiss can be loud but are still not speech. ASR word protection and screen
+    activity protection remain the final safety nets.
+    """
+    global _SILERO_MODEL
+    try:
+        import torch
+        from silero_vad import get_speech_timestamps, load_silero_vad
+    except ImportError:
+        log("⚠️  silero-vad is unavailable; falling back to energy-only pause detection.")
+        return []
+    if _SILERO_MODEL is None:
+        _SILERO_MODEL = load_silero_vad()
+    # The editor has already decoded a 16 kHz mono PCM WAV. Load it directly
+    # instead of torchaudio.read_audio, whose newest release unnecessarily
+    # requires the separate torchcodec package even for WAV input.
+    with wave.open(str(audio_path), "rb") as handle:
+        if handle.getnchannels() != 1 or handle.getsampwidth() != 2 or handle.getframerate() != 16000:
+            raise RuntimeError("Silero VAD requires a 16 kHz mono 16-bit PCM WAV")
+        pcm = array.array("h")
+        pcm.frombytes(handle.readframes(handle.getnframes()))
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    waveform = torch.tensor(pcm, dtype=torch.float32) / 32768.0
+    speech = get_speech_timestamps(
+        waveform,
+        _SILERO_MODEL,
+        threshold=threshold,
+        sampling_rate=16000,
+        min_speech_duration_ms=120,
+        min_silence_duration_ms=120,
+        speech_pad_ms=70,
+        return_seconds=True,
+    )
+    duration_s = float(len(waveform)) / 16000.0
+    nonspeech: list[tuple[float, float]] = []
+    cursor = 0.0
+    for item in speech:
+        start = float(item["start"])
+        end = float(item["end"])
+        if start - cursor >= min_dur:
+            nonspeech.append((cursor, start))
+        cursor = max(cursor, end)
+    if duration_s - cursor >= min_dur:
+        nonspeech.append((cursor, duration_s))
+    log(f"🗣️  Silero VAD: found {len(nonspeech)} non-speech region(s).")
+    return nonspeech
+
+
+def detect_silence_regions_by_session(
+    session_offsets: list[dict],
+    requested_db: str,
+    min_dur: float,
+    *,
+    use_vad: bool = True,
+) -> tuple[list[tuple[float, float]], list[float]]:
+    """Detect silence with a separately calibrated threshold for every session."""
+    timeline_regions_ms: list[tuple[float, float]] = []
+    thresholds: list[float] = []
+    for index, session in enumerate(session_offsets):
+        audio_path = Path(session["file"])
+        mean_db, max_db = measure_audio_levels(audio_path)
+        noise_floor, speech_level = measure_energy_percentiles(audio_path)
+        threshold = resolve_silence_db(requested_db, mean_db, noise_floor, speech_level)
+        thresholds.append(threshold)
+        if mean_db is not None:
+            log(f"🔊 Session {index}: mean {mean_db:.1f} dBFS, peak {max_db:.1f} dBFS.")
+        local_regions = detect_silence_regions(audio_path, noise_db=threshold, min_dur=min_dur)
+        if use_vad:
+            try:
+                local_regions.extend(detect_nonspeech_regions_vad(audio_path, min_dur=min_dur))
+            except Exception as exc:
+                log(f"⚠️  Silero VAD failed for session {index}: {exc}; using energy silence only.")
+            local_regions_ms = merge_intervals(
+                [(start * 1000.0, end * 1000.0) for start, end in local_regions],
+                gap_ms=40.0,
+            )
+            local_regions = [(start / 1000.0, end / 1000.0) for start, end in local_regions_ms]
+        anchor_ms = float(session["timelineOffsetMs"])
+        duration_ms = float(session["durationMs"])
+        for start_s, end_s in local_regions:
+            start_ms = anchor_ms + min(duration_ms, max(0.0, start_s * 1000.0))
+            end_ms = anchor_ms + min(duration_ms, max(0.0, end_s * 1000.0))
+            if end_ms > start_ms:
+                timeline_regions_ms.append((start_ms, end_ms))
+    merged_ms = merge_intervals(timeline_regions_ms, gap_ms=35.0)
+    return [(start / 1000.0, end / 1000.0) for start, end in merged_ms], thresholds
 
 
 def filter_pauses_by_silence(pauses: list[dict], silence_regions: list[tuple[float, float]]) -> list[dict]:
@@ -594,19 +1050,41 @@ def merge_cut_lists(cut_lists: list[list[dict]], min_gap_ms: float = 80.0) -> li
     return merged
 
 
-def detect_repeats(cuts_file: str) -> list[dict]:
+def detect_repeats(
+    cuts_file: str,
+    current_project_data: dict,
+    project_json_path: Path,
+    backup_path: Path | None = None,
+) -> list[dict]:
     """
-    Load repeat cuts from a JSON file produced by Claude in the conversation.
-    Format: [{"start_ms": ..., "end_ms": ..., "removed_text": "..."}]
+    Load reviewed cuts and normalize them to the source timeline.
+
+    Schema-v2 files declare their coordinate space and project fingerprint.
+    Legacy list-only files remain supported as source time with a warning.
     """
     if not cuts_file:
         return []
-    import os
-    if not os.path.exists(cuts_file):
+    if not Path(cuts_file).exists():
         log(f"⚠️  Cuts file not found: {cuts_file}, skipping repeat detection.")
         return []
-    with open(cuts_file) as f:
-        repeats = json.load(f)
+    scenes = current_project_data.get("json", {}).get("scenes") or []
+    if not scenes or not scenes[0].get("slices"):
+        raise CutsValidationError("current project has no slices for cuts validation")
+    accepted_source_hashes = []
+    if backup_path and backup_path.exists():
+        accepted_source_hashes.append(_file_sha256(backup_path))
+    repeats, document = load_cuts_document(
+        Path(cuts_file),
+        current_slices=scenes[0]["slices"],
+        current_project_sha256=_file_sha256(project_json_path),
+        accepted_source_project_sha256s=accepted_source_hashes,
+    )
+    if document.get("legacy"):
+        log("⚠️  Legacy cuts list has no coordinate-space/project fingerprint; assuming SOURCE time.")
+    elif document.get("coordinate_space") == "edited":
+        log(f"🧭 Mapped edited-time cuts through the current {len(scenes[0]['slices'])}-slice timeline.")
+    elif not document.get("project_sha256"):
+        log("⚠️  Source-time cuts have no project fingerprint; coordinates cannot be cross-project verified.")
     log(f"✂️  Loaded {len(repeats)} repeat cut(s) from {cuts_file}")
     for r in repeats:
         log(f"   Remove: \"{r.get('removed_text', '')[:70]}\"")
@@ -681,8 +1159,8 @@ def remove_wordless_pause_slices(
     slices: list[dict],
     segments: list[dict],
     silence_regions: list[tuple[float, float]],
+    activity_intervals: list[tuple[float, float]] | None = None,
     max_duration_ms: float = 2500.0,
-    min_adjacent_gap_ms: float = 300.0,
 ) -> tuple[list[dict], list[dict]]:
     """
     Remove short wordless slices left behind by pause cuts.
@@ -692,15 +1170,17 @@ def remove_wordless_pause_slices(
     timeline as "Clip 2s/3s" blocks with no meaningful waveform. They are too long
     for the old tiny-fragment filter, so clean them up explicitly.
 
-    Without a transcript the "no words in this slice" check cannot protect
-    speech, so the near-jump-cut heuristic is disabled and only slices that are
-    mostly measured silence are removed.
+    "No words" is never sufficient evidence: a screen tutorial can contain an
+    intentional click, wait, animation, or result with no narration.  Removal
+    therefore requires strong measured-silence evidence and no protected screen
+    activity.  The old near-jump-cut shortcut was deliberately removed because
+    it could delete a fully non-silent 2.5 second slice.
     """
     if not slices:
         return slices, []
 
     words = flatten_words(segments)
-    words_available = bool(words)
+    activity_intervals = activity_intervals or []
     removed = []
     kept = []
 
@@ -722,28 +1202,24 @@ def remove_wordless_pause_slices(
             kept.append(sl)
             continue
 
-        prev_gap = start_ms - float(slices[i - 1]["sourceEndMs"]) if i > 0 else 0.0
-        next_gap = float(slices[i + 1]["sourceStartMs"]) - end_ms if i + 1 < len(slices) else 0.0
-
         silence_overlap_ms = 0.0
         for silence_start_s, silence_end_s in silence_regions:
             silence_start_ms = silence_start_s * 1000.0
             silence_end_ms = silence_end_s * 1000.0
             silence_overlap_ms += max(0.0, min(end_ms, silence_end_ms) - max(start_ms, silence_start_ms))
 
-        mostly_measured_silence = duration_ms > 0 and silence_overlap_ms / duration_ms >= 0.5
-        near_jump_cut = words_available and (
-            prev_gap >= min_adjacent_gap_ms or next_gap >= min_adjacent_gap_ms
+        mostly_measured_silence = duration_ms > 0 and silence_overlap_ms / duration_ms >= 0.8
+        has_activity = any(
+            activity_end > start_ms and activity_start < end_ms
+            for activity_start, activity_end in activity_intervals
         )
 
-        if mostly_measured_silence or near_jump_cut:
+        if mostly_measured_silence and not has_activity:
             removed.append({
                 "index": i,
                 "start_ms": start_ms,
                 "end_ms": end_ms,
                 "duration_ms": duration_ms,
-                "prev_gap_ms": prev_gap,
-                "next_gap_ms": next_gap,
                 "silence_overlap_ms": silence_overlap_ms,
             })
         else:
@@ -756,7 +1232,7 @@ def remove_wordless_pause_slices(
                 f"   Drop slice {r['index']}: "
                 f"{r['start_ms']/1000:.3f}s→{r['end_ms']/1000:.3f}s "
                 f"({r['duration_ms']/1000:.2f}s, "
-                f"prev_gap={r['prev_gap_ms']/1000:.2f}s, next_gap={r['next_gap_ms']/1000:.2f}s)"
+                f"silence={r['silence_overlap_ms']/r['duration_ms']:.0%})"
             )
 
     return kept, removed
@@ -809,7 +1285,11 @@ def apply_cuts(slices: list[dict], cuts: list[dict]) -> tuple[list[dict], int]:
             remaining = new_remaining
 
         for (start, end) in remaining:
-            if end - start > 100:  # Skip tiny fragments < 100ms
+            # Never discard a 1–100 ms remainder merely because it is small: it
+            # can contain a consonant onset or the tail of a click. Screen Studio
+            # accepts positive millisecond ranges; safe wordless cleanup happens
+            # later with audio/activity evidence.
+            if end - start > 1:
                 new_slice = dict(sl)
                 new_slice["sourceStartMs"] = start
                 new_slice["sourceEndMs"] = end
@@ -826,22 +1306,13 @@ def apply_cuts(slices: list[dict], cuts: list[dict]) -> tuple[list[dict], int]:
 
 def pad_repeat_cuts(repeats: list[dict]) -> list[dict]:
     """
-    Add 150ms inward padding to repeat cuts to protect neighboring speech from clipping.
-    ASR start/end timestamps for a segment have ±100-200ms inaccuracy — the "start_ms"
-    of the region to remove might land slightly inside the last good word. Shrinking each
-    repeat cut inward by 150ms on both ends preserves the natural word onset/offset.
+    Backward-compatible no-op.
+
+    Fixed inward padding used to erase short fillers and leave audible fragments
+    of longer repeats.  ``refine_repeat_cut_boundaries`` now finds quiet waveform
+    points around the complete reviewed phrase instead.
     """
-    REPEAT_PAD_MS = 150
-    padded_repeats = []
-    for r in repeats:
-        padded = dict(r)
-        padded["start_ms"] = r["start_ms"] + REPEAT_PAD_MS
-        padded["end_ms"] = r["end_ms"] - REPEAT_PAD_MS
-        if padded["end_ms"] > padded["start_ms"] + 200:
-            padded_repeats.append(padded)
-        else:
-            log(f"⚠️  Repeat cut too short after padding, skipping: \"{r.get('removed_text','')[:50]}\"")
-    return padded_repeats
+    return [dict(repeat) for repeat in repeats]
 
 
 def log_long_cuts(cuts: list[dict], threshold_ms: float = 5000.0):
@@ -872,7 +1343,17 @@ def load_external_edit_state(project_json_path: Path, state_path: Path) -> bool:
         return False
 
 
-def run_incremental_repeat_cuts(project_json_path: Path, state_path: Path, cuts_file: str):
+def run_incremental_repeat_cuts(
+    project_json_path: Path,
+    state_path: Path,
+    cuts_file: str,
+    *,
+    protect_screen_activity: bool = True,
+    visual_scan: bool = True,
+    visual_scan_fps: float = 2.5,
+    visual_change_threshold: float = 0.012,
+    allow_active_repeat_cuts: bool = False,
+):
     """
     Apply repeat cuts on top of the CURRENT project.json without touching
     anything else. Used when the project was edited externally (e.g. in
@@ -889,10 +1370,63 @@ def run_incremental_repeat_cuts(project_json_path: Path, state_path: Path, cuts_
         log("❌ project.json has no scenes/slices — unexpected format, aborting.")
         sys.exit(1)
 
-    repeats = pad_repeat_cuts(detect_repeats(cuts_file))
+    try:
+        repeats = detect_repeats(
+            cuts_file,
+            project_data,
+            project_json_path,
+            project_json_path.with_suffix(".json.bak"),
+        )
+    except CutsValidationError as exc:
+        log(f"❌ Unsafe cuts file: {exc}")
+        sys.exit(1)
     if not repeats:
         log("❌ No usable cuts in the cuts file — nothing to do.")
         sys.exit(1)
+
+    project_dir = project_json_path.parent
+    metadata = load_metadata(project_dir)
+    mic_sessions = get_mic_sessions(metadata)
+    transcript_path = project_dir / "transcript.edit.json"
+    if not transcript_path.exists():
+        transcript_path = project_dir / "transcript.json"
+    segments = []
+    if transcript_path.exists():
+        try:
+            segments = json.loads(transcript_path.read_text(encoding="utf-8"))
+        except Exception:
+            segments = []
+
+    session_offsets: list[dict] = []
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            merged_audio = tmp / "merged_mic.wav"
+            session_offsets = merge_audio(project_dir, mic_sessions, merged_audio, tmp)
+            repeats = refine_repeat_cut_boundaries(
+                repeats, flatten_words(segments), merged_audio, session_offsets
+            )
+    except Exception as exc:
+        log(f"⚠️  Incremental boundary refinement unavailable: {exc}")
+
+    if protect_screen_activity and session_offsets:
+        activity_intervals = load_input_activity_intervals(project_dir, metadata, session_offsets)
+        if visual_scan:
+            activity_intervals.extend(detect_visual_activity_intervals(
+                project_dir,
+                metadata,
+                session_offsets,
+                fps=visual_scan_fps,
+                scene_threshold=visual_change_threshold,
+            ))
+        activity_intervals = merge_intervals(activity_intervals, gap_ms=120.0)
+        if not allow_active_repeat_cuts:
+            repeats, protected = protect_cuts_with_activity(repeats, activity_intervals)
+            if protected:
+                log(f"🛡️  Kept {len(protected)} incremental cut(s) containing screen activity.")
+        if not repeats:
+            log("❌ Every reviewed cut overlaps protected screen activity — nothing applied.")
+            sys.exit(1)
 
     original_slices = scenes[0]["slices"]
     new_slices, cuts_applied = apply_cuts(original_slices, repeats)
@@ -935,7 +1469,23 @@ def main():
                              "clipped); raise toward -20 to cut more aggressively for noisy mics.")
     parser.add_argument("--silence-min-dur", type=float, default=0.3,
                         help="Minimum silence length in seconds for silencedetect (default: 0.3).")
+    parser.add_argument("--no-vad", action="store_true",
+                        help="Disable local Silero voice-activity detection and use energy silence only.")
     parser.add_argument("--cuts-file", default=None, help="JSON file with repeat cuts (produced by Claude in conversation)")
+    parser.add_argument("--no-screen-activity-protection", action="store_true",
+                        help="Disable click/keystroke and display-change protection (unsafe for tutorials).")
+    parser.add_argument("--no-visual-scan", action="store_true",
+                        help="Protect clicks/keystrokes but skip the low-resolution display-change scan.")
+    parser.add_argument("--visual-scan-fps", type=float, default=2.5,
+                        help="Display activity scan rate (default: 2.5 fps).")
+    parser.add_argument("--visual-change-threshold", type=float, default=0.012,
+                        help="ffmpeg scene-score threshold for protected display changes (default: 0.012).")
+    parser.add_argument("--allow-active-repeat-cuts", action="store_true",
+                        help="Allow reviewed repeat cuts to remove intervals containing detected screen actions.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Analyze and write an audit report without modifying project.json or creating a backup.")
+    parser.add_argument("--report-output", type=Path,
+                        help="Optional audit report path. Normal runs default beside the project; dry runs default to /tmp.")
     parser.add_argument("--skip-transcribe", help="Path to existing transcript JSON to reuse")
     parser.add_argument("--language", default="zh",
                         help="ASR language code (default: zh). Use 'en' for English, 'None' to auto-detect.")
@@ -959,9 +1509,19 @@ def main():
     project_json_path = project_dir / "project.json"
     backup_path = project_dir / "project.json.bak"
     state_path = project_dir / ".autoedit-state.json"
+    report_path = args.report_output or (
+        Path(tempfile.gettempdir()) / f"{project_dir.stem}-autoedit-report.json"
+        if args.dry_run else project_dir / "autoedit-report.json"
+    )
+    dry_transcript_cache_path: Path | None = None
 
-    # Backup (no-op if backup already exists)
-    backup_project(project_json_path)
+    if not project_json_path.exists():
+        log(f"❌ project.json not found: {project_json_path}")
+        sys.exit(1)
+
+    # A dry run must not mutate the bundle merely by creating the backup.
+    if not args.dry_run:
+        backup_project(project_json_path)
 
     # If project.json changed since our last run, someone edited it externally
     # (opening/saving in Screen Studio counts). Re-applying from the backup
@@ -970,14 +1530,27 @@ def main():
     #     timeline and keep everything else untouched;
     #   - otherwise: refuse, unless --discard-external-edits explicitly asks
     #     to start over from the original backup.
-    externally_edited = backup_path.exists() and load_external_edit_state(project_json_path, state_path)
+    externally_edited = (
+        not args.dry_run
+        and backup_path.exists()
+        and load_external_edit_state(project_json_path, state_path)
+    )
     if externally_edited and not args.discard_external_edits:
         log("⚠️  project.json changed since the last auto-edit run "
             "(edited or re-saved in Screen Studio?).")
         if args.cuts_file:
             log("    Applying the new cuts incrementally to the CURRENT timeline; "
                 "external edits are preserved.")
-            run_incremental_repeat_cuts(project_json_path, state_path, args.cuts_file)
+            run_incremental_repeat_cuts(
+                project_json_path,
+                state_path,
+                args.cuts_file,
+                protect_screen_activity=not args.no_screen_activity_protection,
+                visual_scan=not args.no_visual_scan,
+                visual_scan_fps=args.visual_scan_fps,
+                visual_change_threshold=args.visual_change_threshold,
+                allow_active_repeat_cuts=args.allow_active_repeat_cuts,
+            )
             return
         log("    Refusing to re-run the full edit: it would rebuild from project.json.bak")
         log("    and DISCARD everything changed since the last run.")
@@ -985,12 +1558,22 @@ def main():
         log("    --discard-external-edits to intentionally start over from the backup.")
         sys.exit(2)
 
-    # Always load from backup — it is created on the first run and never
+    # Keep the current slice map as well as the pristine backup. Edited-time
+    # review cuts must be mapped through the exact CURRENT slices that produced
+    # the export, while the full edit is rebuilt idempotently from the backup.
+    with open(project_json_path) as f:
+        current_project_data = json.load(f)
+
+    # Normal runs rebuild from the pristine backup. Dry runs analyze the current
+    # timeline exactly as it exists and never write it.
     # overwritten, so it always holds the original unedited project.json.
     # This makes every run idempotent: pauses + repeats are applied to the
     # original slices, never to already-cut slices from a prior run.
-    with open(backup_path) as f:
-        project_data = json.load(f)
+    if args.dry_run:
+        project_data = json.loads(json.dumps(current_project_data))
+    else:
+        with open(backup_path) as f:
+            project_data = json.load(f)
 
     # Load metadata
     metadata = load_metadata(project_dir)
@@ -1018,10 +1601,29 @@ def main():
             # slice-timeline coordinates — do not remap them again.
             with open(args.skip_transcribe) as f:
                 segments = json.load(f)
+            if args.dry_run:
+                dry_transcript_cache_path = Path(args.skip_transcribe)
+            else:
+                serialized = json.dumps(segments, indent=2, ensure_ascii=False)
+                (project_dir / "transcript.json").write_text(serialized, encoding="utf-8")
+                (project_dir / "transcript.edit.json").write_text(serialized, encoding="utf-8")
+                (project_dir / "transcript.edit.meta.json").write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "coordinate_space": "source",
+                        "project_sha256": _file_sha256(backup_path),
+                        "fillers_preserved": True,
+                        "segmentation": "reused_edit_transcript",
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
             log(f"♻️  Loaded existing transcript from {args.skip_transcribe}")
         else:
             lang = None if args.language == "None" else args.language
-            raw_asr_out = project_dir / "bailian_asr.json" if args.asr_backend == "bailian" else None
+            raw_asr_out = (
+                (tmp / "bailian_asr.json" if args.dry_run else project_dir / "bailian_asr.json")
+                if args.asr_backend == "bailian" else None
+            )
             segments = None
             last_error = None
             for attempt in (1, 2):
@@ -1052,31 +1654,43 @@ def main():
                 # into slice-timeline coordinates so transcript.json matches the
                 # slices (and cuts.json values can be copied from it verbatim).
                 segments = remap_segments_to_timeline(segments, session_offsets)
-                transcript_out = project_dir / "transcript.json"
-                with open(transcript_out, "w") as f:
-                    json.dump(segments, f, indent=2, ensure_ascii=False)
-                log(f"💾 Saved transcript → transcript.json (slice-timeline coordinates)")
+                if args.dry_run:
+                    dry_transcript_cache_path = report_path.with_name(
+                        f"{report_path.stem}.transcript.edit.json"
+                    )
+                    dry_transcript_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    dry_transcript_cache_path.write_text(
+                        json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8"
+                    )
+                    log(f"🧪 Dry run: cached edit transcript outside the project → {dry_transcript_cache_path}")
+                else:
+                    transcript_out = project_dir / "transcript.json"
+                    edit_transcript_out = project_dir / "transcript.edit.json"
+                    serialized = json.dumps(segments, indent=2, ensure_ascii=False)
+                    transcript_out.write_text(serialized, encoding="utf-8")
+                    edit_transcript_out.write_text(serialized, encoding="utf-8")
+                    (project_dir / "transcript.edit.meta.json").write_text(
+                        json.dumps({
+                            "schema_version": 1,
+                            "coordinate_space": "source",
+                            "project_sha256": _file_sha256(backup_path),
+                            "fillers_preserved": True,
+                            "segmentation": "raw_asr_sentences",
+                        }, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    log("💾 Saved edit transcript → transcript.edit.json + transcript.json "
+                        "(SOURCE time, fillers preserved)")
 
-        # Measure the audio level so the silence threshold can adapt to (or be
-        # sanity-checked against) this recording's actual loudness. A fixed dB
-        # threshold is the weakest link in silence cutting: too high clips quiet
-        # speech, too low keeps hiss.
-        mean_db, max_db = measure_audio_levels(merged_audio)
-        if mean_db is not None:
-            log(f"🔊 Audio level: mean {mean_db:.1f} dBFS, peak {max_db:.1f} dBFS.")
-        silence_db = resolve_silence_db(args.silence_db, mean_db)
-        if (str(args.silence_db).strip().lower() != "auto"
-                and mean_db is not None and mean_db < silence_db):
-            log(f"⚠️  Mean audio level ({mean_db:.1f} dBFS) is below the silence threshold "
-                f"({silence_db} dB); quiet speech may be over-cut. "
-                f"Consider --silence-db auto or a lower value (e.g. {round(mean_db - 10)}).")
-
-        silence_regions = detect_silence_regions(
-            merged_audio, noise_db=silence_db, min_dur=args.silence_min_dur
+        # Calibrate silence separately per recording session. A global mean is
+        # distorted by long dead-air stretches and by gain changes after pause/
+        # resume; short-window p20/p80 energy estimates are substantially safer.
+        silence_regions, _silence_thresholds = detect_silence_regions_by_session(
+            session_offsets,
+            args.silence_db,
+            args.silence_min_dur,
+            use_vad=not args.no_vad,
         )
-        # Silence was measured on the merged audio; move it into slice-timeline
-        # coordinates so every downstream consumer shares the slices' clock.
-        silence_regions = remap_regions_to_timeline(silence_regions, session_offsets)
 
         pause_cut_lists = []
         if args.pause_source in {"silence", "both"}:
@@ -1109,8 +1723,50 @@ def main():
         # exempt — removing recognized speech is their entire purpose.
         pauses = protect_words_from_cuts(pauses, flatten_words(segments))
 
-        # Load repeat cuts (produced by Claude in the conversation, if any)
-        repeats = pad_repeat_cuts(detect_repeats(args.cuts_file))
+        # Load reviewed cuts with explicit coordinate-space/project validation,
+        # then refine semantic ASR/model ranges to nearby waveform minima.
+        try:
+            repeats = detect_repeats(
+                args.cuts_file,
+                current_project_data,
+                project_json_path,
+                backup_path,
+            )
+        except CutsValidationError as exc:
+            log(f"❌ Unsafe cuts file: {exc}")
+            sys.exit(1)
+        repeats = refine_repeat_cut_boundaries(
+            repeats,
+            flatten_words(segments),
+            merged_audio,
+            session_offsets,
+        )
+
+        # A silent microphone is not a blank tutorial. Protect click/keystroke
+        # events and meaningful display changes before any automatic cut lands.
+        activity_intervals: list[tuple[float, float]] = []
+        protected_pauses: list[dict] = []
+        protected_repeats: list[dict] = []
+        if not args.no_screen_activity_protection and (pauses or repeats):
+            activity_intervals.extend(
+                load_input_activity_intervals(project_dir, metadata, session_offsets)
+            )
+            if not args.no_visual_scan:
+                activity_intervals.extend(detect_visual_activity_intervals(
+                    project_dir,
+                    metadata,
+                    session_offsets,
+                    fps=args.visual_scan_fps,
+                    scene_threshold=args.visual_change_threshold,
+                ))
+            activity_intervals = merge_intervals(activity_intervals, gap_ms=120.0)
+            pauses, protected_pauses = protect_cuts_with_activity(pauses, activity_intervals)
+            if protected_pauses:
+                log(f"🛡️  Kept {len(protected_pauses)} silent interval(s) containing screen activity.")
+            if not args.allow_active_repeat_cuts:
+                repeats, protected_repeats = protect_cuts_with_activity(repeats, activity_intervals)
+                if protected_repeats:
+                    log(f"🛡️  Kept {len(protected_repeats)} reviewed cut(s) containing screen activity.")
 
         all_cuts = pauses + repeats
         log_long_cuts(all_cuts)
@@ -1141,7 +1797,12 @@ def main():
 
         session_boundaries = get_session_boundaries_ms(session_offsets)
         new_slices, snapped = snap_to_session_boundaries(new_slices, session_boundaries)
-        new_slices, removed_wordless_slices = remove_wordless_pause_slices(new_slices, segments, silence_regions)
+        new_slices, removed_wordless_slices = remove_wordless_pause_slices(
+            new_slices,
+            segments,
+            silence_regions,
+            activity_intervals,
+        )
 
         # Calculate time saved
         original_duration = sum(s["sourceEndMs"] - s["sourceStartMs"] for s in original_slices)
@@ -1163,26 +1824,55 @@ def main():
         project_data["json"]["config"]["improveMicrophoneAudio"] = True  # 降噪 + 音量均一化
         # Note: cameraRoundness is intentionally NOT set — keep Screen Studio's default roundness
 
-        # Write updated project.json
-        with open(project_json_path, "w") as f:
-            json.dump(project_data, f, ensure_ascii=False, separators=(",", ":"))
+        audit_report = {
+            "schema_version": 1,
+            "dry_run": args.dry_run,
+            "project": str(project_dir),
+            "project_sha256": _file_sha256(project_json_path),
+            "pause_threshold_ms": args.pause_threshold,
+            "min_pause_ms": args.min_pause,
+            "vad_enabled": not args.no_vad,
+            "screen_activity_protection": not args.no_screen_activity_protection,
+            "silence_thresholds_db": _silence_thresholds,
+            "pauses_applied": pauses,
+            "reviewed_cuts_applied": repeats,
+            "pauses_protected_by_activity": protected_pauses,
+            "reviewed_cuts_protected_by_activity": protected_repeats,
+            "activity_intervals_ms": activity_intervals,
+            "wordless_slices_removed": removed_wordless_slices,
+            "original_duration_ms": original_duration,
+            "new_duration_ms": new_duration,
+            "saved_ms": saved_ms,
+            "cuts_applied_to_slices": cuts_applied,
+            "edit_transcript_cache": str(dry_transcript_cache_path) if dry_transcript_cache_path else None,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(audit_report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
-        # Record what we wrote so the next run can detect external edits.
-        try:
-            state_path.write_text(json.dumps({"last_written_sha": _file_sha256(project_json_path)}))
-        except Exception:
-            pass
+        if not args.dry_run:
+            # Write updated project.json
+            with open(project_json_path, "w") as f:
+                json.dump(project_data, f, ensure_ascii=False, separators=(",", ":"))
+
+            # Record what we wrote so the next run can detect external edits.
+            try:
+                state_path.write_text(json.dumps({"last_written_sha": _file_sha256(project_json_path)}))
+            except Exception:
+                pass
 
         log("")
         log("=" * 50)
-        log("✅ Done! Summary:")
-        log(f"   Pauses removed:    {len(pauses)}")
-        log(f"   Repeats removed:   {len(repeats)}")
+        log("🧪 Dry-run analysis complete; project.json was not modified:" if args.dry_run else "✅ Done! Summary:")
+        log(f"   {'Pauses proposed' if args.dry_run else 'Pauses removed'}:    {len(pauses)}")
+        log(f"   {'Repeats proposed' if args.dry_run else 'Repeats removed'}:   {len(repeats)}")
         log(f"   Silent slices:     {len(removed_wordless_slices)}")
         log(f"   Total cuts:        {cuts_applied}")
         log(f"   Original duration: {original_duration/1000:.1f}s")
         log(f"   New duration:      {new_duration/1000:.1f}s")
-        log(f"   Time saved:        {saved_ms/1000:.1f}s ({saved_ms/original_duration*100:.1f}%)")
+        saved_percent = saved_ms / original_duration * 100 if original_duration else 0.0
+        log(f"   Time saved:        {saved_ms/1000:.1f}s ({saved_percent:.1f}%)")
         log(f"   Output ratio:      4:3 ✓")
         log(f"   Padding:           2% ✓")
         log(f"   Rounded corners:   25 ✓")
@@ -1194,9 +1884,13 @@ def main():
             log("    Re-run later (without --skip-transcribe) for repeat review, or proceed")
             log("    with pause-only editing.")
 
+        log(f"   Audit report:      {report_path}")
         log("")
-        log("Open Screen Studio to preview the result.")
-        log("Backup saved as project.json.bak")
+        if args.dry_run:
+            log("Review the audit report, then run again without --dry-run to apply.")
+        else:
+            log("Open Screen Studio to preview the result.")
+            log("Backup saved as project.json.bak")
 
         if repeats:
             log("")
