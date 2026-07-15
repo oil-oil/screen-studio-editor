@@ -103,10 +103,11 @@ The workflow reads the ZenMux key from `ZENMUX_API_KEY` or
 `~/.zenmux_api_key`; never put a key in the repository or a report. It reuses
 ASR, the aligned proxy, the full-video planner response, and the preference
 decision whenever their fingerprints still match. On a five-project
-leave-one-video-out benchmark, the fully Gemini-only path reached about 98.0%
-time precision and 42.6% coverage of the creator's hand cuts; the older safe
-path covered about 30.7%. Treat those figures as regression evidence, not a
-guarantee for unrelated recording styles.
+leave-one-video-out benchmark, the fully Gemini-only path reached about 97.7%
+time precision and 47.7% coverage of the creator's hand cuts (64.1% time F1);
+the older safe path covered about 30.7%. The Gemini arbitration step took
+roughly 8–12 seconds per benchmark video. Treat those figures as regression
+evidence, not a guarantee for unrelated recording styles.
 
 For a recording that genuinely needs pause cleanup only, the direct apply path remains:
 
@@ -161,9 +162,12 @@ Gemini whole-timeline review (default for this creator):
 - Speech candidates require valid transcript IDs plus verbatim removed and
   replacement quotes. Model timestamps or reasons that point at different
   words are rejected locally.
-- Screen-active pauses below six seconds remain untouched. Longer subjective
-  pauses get 35 seconds of transcript context so an earlier “pause/read/show”
-  instruction protects the complete result-showcase sequence.
+- A screen-active silence of at least two seconds becomes a review hypothesis,
+  not an automatic deletion. Gemini receives 35 seconds of transcript context
+  so an earlier “pause/read/show” instruction protects the complete
+  result-showcase sequence; only high-confidence complete ranges survive the
+  preference arbiter. Keep shorter pauses local. Do not lower this gate to zero:
+  reviewing every pause diluted the prompt and reduced held-out accuracy.
 - Continuously changing visuals with almost no mouse/keyboard telemetry are
   protected even if the model votes to cut; this catches animations, result
   playback, and passive showcases that look like navigation to a text model.

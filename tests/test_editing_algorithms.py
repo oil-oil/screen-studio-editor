@@ -713,6 +713,29 @@ class CandidateRecallTests(unittest.TestCase):
 
 
 class PreferenceArbiterTests(unittest.TestCase):
+    def test_default_reviews_screen_active_pauses_from_two_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "baseline-report.transcript.edit.json").write_text(
+                json.dumps({"segments": [
+                    {"start": 0.0, "end": 1.0, "text": "前一句"},
+                    {"start": 6.0, "end": 7.0, "text": "后一句"},
+                ]})
+            )
+            (project / "baseline-report.json").write_text(json.dumps({
+                "pauses_protected_by_activity": [
+                    {"start_ms": 1200, "end_ms": 3000, "duration_ms": 1800},
+                    {"start_ms": 3200, "end_ms": 5700, "duration_ms": 2500},
+                ]
+            }))
+
+            rows = preference_edit_arbiter.candidate_rows(project)
+
+            self.assertEqual(preference_edit_arbiter.PROTECTED_PAUSE_MIN_MS, 2_000.0)
+            self.assertEqual([(row["start_ms"], row["end_ms"]) for row in rows], [
+                (3200, 5700),
+            ])
+
     def test_smart_workflow_writes_source_time_cuts(self):
         document = smart_edit_workflow.cuts_document(
             Path("/tmp/example.screenstudio"),
