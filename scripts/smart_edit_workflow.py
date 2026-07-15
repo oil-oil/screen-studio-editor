@@ -111,6 +111,9 @@ def candidate_cut(candidate: dict[str, Any], *, local: bool = False) -> dict[str
     for key in ("spoken_start_ms", "spoken_end_ms"):
         if candidate.get(key) is not None:
             cut[key] = candidate[key]
+    for key in ("screen_action", "visual_assessment"):
+        if candidate.get(key):
+            cut[key] = candidate[key]
     if local:
         cut["local_micro_decision"] = True
     else:
@@ -240,6 +243,7 @@ def main() -> None:
             "--output", str(arbiter_report),
             "--model", args.model,
             "--candidate-source", "global",
+            "--video", str(combined_video),
             "--resume",
         ],
         "Gemini creator-style arbitration",

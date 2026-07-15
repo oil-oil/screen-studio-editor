@@ -28,9 +28,9 @@ from global_edit_planner import file_sha256, grounded_silent_range, transcript_a
 GLOBAL_REPORT_NAMES = ("global-video-planner-gemini35flash-v4.json",)
 STRUCTURED_REPORT_NAMES = ("structured-edit-candidates-v1.json",)
 DEFAULT_MODEL = "google/gemini-3.5-flash"
-ARBITER_VERSION = 2
-SHORT_SPEECH_GUARD_MAX_MS = 3_500.0
-MIN_SHORT_REPLACEMENT_SIMILARITY = 0.2
+ARBITER_VERSION = 6
+SHORT_SPEECH_GUARD_MAX_MS = 4_000.0
+MIN_SHORT_REPLACEMENT_SIMILARITY = 0.25
 # A pause above this threshold becomes a review hypothesis, not an automatic cut.
 # Five-video leave-one-out validation found 2 s improved recall materially while
 # retaining 97.68% time precision; reviewing every pause diluted the model prompt.
@@ -82,6 +82,15 @@ def automatic_safety_blocker(candidate: dict[str, Any]) -> str | None:
         "possible_abandoned_sentence",
     }:
         return "broad_structural_candidate_requires_manual_review"
+    if (
+        candidate_family(candidate) == "screen_pause"
+        and candidate.get("video_review_supplied")
+        and (
+            candidate.get("screen_action") not in {"none", "redundant"}
+            or not str(candidate.get("visual_assessment") or "").strip()
+        )
+    ):
+        return "video_did_not_clear_screen_activity"
     duration_ms = float(candidate.get("duration_ms") or 0.0)
     if not duration_ms and candidate.get("start") is not None and candidate.get("end") is not None:
         duration_ms = (
@@ -362,6 +371,12 @@ def prompt_for_arbitration(
                 "repair_marker": candidate.get("repair_marker"),
                 "local_acoustic_safe": bool(candidate.get("local_acoustic_safe")),
             })
+        if video_supplied:
+            target["allowed_screen_actions"] = (
+                ["redundant", "meaningful"]
+                if float(candidate.get("input_activity_fraction") or 0.0) > 0.0
+                else ["none", "redundant", "meaningful"]
+            )
         compact_targets.append(target)
     schema = {
         "decisions": [
@@ -373,6 +388,11 @@ def prompt_for_arbitration(
             }
         ]
     }
+    if video_supplied:
+        schema["decisions"][0].update({
+            "screen_action": "none | redundant | meaningful | unclear",
+            "visual_assessment": "specific visible action/result in this range",
+        })
     speech_label_note = ""
     structured_note = ""
     if candidate_source in {"structured", "all"}:
@@ -397,6 +417,7 @@ examples. Decide the target candidates in the same style. The labels mean:
   unsafe for automatic deletion.
 {speech_label_note}
 {"A complete source-timeline-aligned video with microphone audio is attached. Inspect the actual screen state, delivery, and full sequence before deciding." if video_supplied else "No video is attached to this pass; use the grounded transcript context."}
+{"For every target, report screen_action using only that target's allowed_screen_actions and add a concrete visual_assessment. Telemetry is authoritative: when none is absent, a click or keystroke was recorded; inspect the video and choose redundant only when the action is disposable setup/navigation, otherwise choose meaningful. Use none only when it is allowed and the video confirms that a visual detector fired on a genuinely static range. Use meaningful for unique clicks, typing, demonstrations, readable results, or visual comparisons. A screen_pause can be automatically cleared across detected screen activity only when you return cut/high plus none or redundant and a specific visual assessment; the final editor still treats input telemetry more strictly than visual-only activity." if video_supplied else ""}
 
 Important preferences to infer from examples:
 - whether the creator leaves screen navigation or reading time visible;
@@ -582,9 +603,28 @@ def arbitrate(args: argparse.Namespace) -> None:
             "confidence": confidence if confidence in {"high", "medium", "low"} else "low",
             "reason": str(raw.get("reason") or ""),
         }
+        if args.video:
+            screen_action = str(raw.get("screen_action") or "unclear").strip().lower()
+            allowed_screen_actions = (
+                {"redundant", "meaningful"}
+                if float(by_id[candidate_id].get("input_activity_fraction") or 0.0) > 0.0
+                else {"none", "redundant", "meaningful"}
+            )
+            item["screen_action"] = (
+                screen_action
+                if screen_action in allowed_screen_actions
+                else "unclear"
+            )
+            item["visual_assessment"] = str(
+                raw.get("visual_assessment") or ""
+            ).strip()
         decisions.append(item)
         if item["decision"] == "cut" and item["confidence"] == "high":
             candidate = dict(by_id[candidate_id])
+            if args.video:
+                candidate["video_review_supplied"] = True
+                candidate["screen_action"] = item["screen_action"]
+                candidate["visual_assessment"] = item["visual_assessment"]
             blocker = automatic_safety_blocker(candidate)
             if blocker:
                 item["safety_blocker"] = blocker

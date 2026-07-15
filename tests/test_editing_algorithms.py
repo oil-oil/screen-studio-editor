@@ -739,6 +739,27 @@ class PreferenceArbiterTests(unittest.TestCase):
         )
         self.assertIsNone(preference_edit_arbiter.automatic_safety_blocker(long_take))
 
+    def test_video_must_explicitly_clear_screen_pause_activity(self):
+        candidate = {
+            "start": 10.0,
+            "end": 20.0,
+            "planner_category": "screen_pause",
+            "video_review_supplied": True,
+            "screen_action": "meaningful",
+            "visual_assessment": "The result is being demonstrated.",
+        }
+        self.assertEqual(
+            preference_edit_arbiter.automatic_safety_blocker(candidate),
+            "video_did_not_clear_screen_activity",
+        )
+        candidate.update({
+            "screen_action": "none",
+            "visual_assessment": "The page is static with no unique action or result.",
+        })
+        self.assertIsNone(
+            preference_edit_arbiter.automatic_safety_blocker(candidate)
+        )
+
     def test_structured_micro_gate_keeps_only_long_isolated_filler_and_exact_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -830,6 +851,19 @@ class PreferenceArbiterTests(unittest.TestCase):
         self.assertTrue(document["cuts"][1]["local_micro_decision"])
         self.assertEqual(document["cuts"][1]["candidate_type"], "hard_filler")
         self.assertEqual(document["cuts"][1]["spoken_start_ms"], 3040)
+
+    def test_smart_cut_preserves_multimodal_activity_clearance(self):
+        cut = smart_edit_workflow.candidate_cut({
+            "start_ms": 1000,
+            "end_ms": 5000,
+            "planner_category": "screen_pause",
+            "screen_action": "redundant",
+            "visual_assessment": "Only a loading spinner changes.",
+        })
+        self.assertEqual(cut["screen_action"], "redundant")
+        self.assertEqual(
+            cut["visual_assessment"], "Only a loading spinner changes."
+        )
 
     def test_final_audit_cache_requires_exact_signature(self):
         with tempfile.TemporaryDirectory() as tmp:

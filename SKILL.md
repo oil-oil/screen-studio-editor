@@ -81,11 +81,16 @@ For ordinary talking-head/screen-tutorial recordings, the recommended path is
 the cached Gemini-only workflow. It performs the local dry run, builds one
 source-aligned A/V proxy, asks `google/gemini-3.5-flash` for grounded
 whole-timeline candidates, learns the creator's light-editing preference from
-the held-out benchmark examples, adds a conservative local micro-edit pass,
-and performs a second dry run. The local pass removes only an acoustically
-isolated strong filler lasting at least 400 ms or a short tail take repeated
-almost exactly; ambiguous short fillers and approximate restarts are kept. It
-does not write the timeline unless `--apply` is explicitly added:
+the held-out benchmark examples, and lets the same personalized arbitration
+call inspect the aligned video before it clears any screen-active cut. The
+arbiter must describe the visible action and classify it as meaningful or
+redundant; click/keystroke telemetry constrains the allowed answer and remains
+the stricter final guard. The workflow also adds a conservative local
+micro-edit pass and performs a second dry run. The local pass removes only an
+acoustically isolated strong filler lasting at least 400 ms or a short tail
+take repeated almost exactly; ambiguous short fillers and approximate
+restarts are kept. It does not write the timeline unless `--apply` is
+explicitly added:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
@@ -112,12 +117,13 @@ local micro-edit pass does not call an API and normally completes in under a
 second. A final safety
 gate rejects short speech deletions when the model cannot point to a concrete
 repeated or corrected structure; a difficult “maybe retake” stays in the
-video. On a five-project leave-one-video-out benchmark, the selected
-conservative path reached about 98.1% time precision and 50.8% coverage of the
-creator's hand cuts (67.0% time F1); the earlier Gemini path reached about
-97.7% precision, 47.7% coverage, and 64.1% F1, while the older safe path
-covered about 30.7%. The Gemini arbitration step took roughly 8–12 seconds per
-benchmark video. Treat those figures as regression evidence, not a guarantee
+video. A fresh five-project July regression measured the cuts that survived
+the final activity guard at about 98.2% time precision and 53.7% coverage of
+the creator's hand cuts (69.4% time F1). Five additional, previously unseen
+June projects reached about 98.2% precision and 79.9% coverage (88.1% F1).
+First-time end-to-end analysis took roughly 1.5–5 minutes per 5–11 minute
+multi-session benchmark project; an unchanged cached rerun took about
+0.5–0.6 seconds. Treat those figures as regression evidence, not a guarantee
 for unrelated recording styles.
 
 For a recording that genuinely needs pause cleanup only, the direct apply path remains:
