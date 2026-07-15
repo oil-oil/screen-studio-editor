@@ -20,6 +20,7 @@ import gemini_edit_candidates as candidates
 import global_edit_planner
 import consensus_edit_candidates
 import preference_edit_arbiter
+import structured_edit_candidates
 import smart_edit_workflow
 import process
 
@@ -713,6 +714,137 @@ class CandidateRecallTests(unittest.TestCase):
 
 
 class PreferenceArbiterTests(unittest.TestCase):
+    def test_short_speech_needs_structural_replacement_before_auto_cut(self):
+        unrelated = {
+            "start": 10.0,
+            "end": 12.8,
+            "duration_ms": 2800,
+            "planner_category": "abandoned_take",
+            "removed_text": "我们在内置，呃，浏览器调试，呃",
+            "kept_text": "做这些自动化工作会更加方便",
+        }
+        exact_restart = {
+            **unrelated,
+            "removed_text": "然后除此以外",
+            "kept_text": "然后除此以外它还增加了一个档位",
+        }
+        long_take = {**unrelated, "duration_ms": 5000}
+
+        self.assertEqual(
+            preference_edit_arbiter.automatic_safety_blocker(unrelated),
+            "short_speech_without_structural_replacement",
+        )
+        self.assertIsNone(
+            preference_edit_arbiter.automatic_safety_blocker(exact_restart)
+        )
+        self.assertIsNone(preference_edit_arbiter.automatic_safety_blocker(long_take))
+
+    def test_structured_micro_gate_keeps_only_long_isolated_filler_and_exact_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "transcript.json"
+            activity = root / "activity.json"
+            transcript.write_text(json.dumps({"segments": [
+                {"start": 0.0, "end": 2.0, "text": "前呃后", "words": [
+                    word("前", 0.0, 0.4), word("呃", 0.7, 1.2), word("后", 1.5, 2.0),
+                ]},
+                {"start": 3.0, "end": 4.0, "text": "好这个是混元三", "words": [
+                    word("好", 3.0, 3.2), word("这个", 3.2, 3.5),
+                    word("是", 3.5, 3.7), word("混元三", 3.7, 4.0),
+                ]},
+                {"start": 5.0, "end": 6.0, "text": "好这个是混元三", "words": [
+                    word("好", 5.0, 5.2), word("这个", 5.2, 5.5),
+                    word("是", 5.5, 5.7), word("混元三", 5.7, 6.0),
+                ]},
+                {"start": 7.0, "end": 8.4, "text": "又呃来", "words": [
+                    word("又", 7.0, 7.3), word("呃", 7.6, 7.92),
+                    word("来", 8.2, 8.4),
+                ]},
+            ]}))
+            activity.write_text(json.dumps({"input_activity_intervals_ms": []}))
+
+            candidates = structured_edit_candidates.build_structured_candidates(
+                transcript, activity
+            )
+
+            self.assertEqual(
+                [item["detector_type"] for item in candidates],
+                ["hard_filler", "possible_tail_restart"],
+            )
+            self.assertEqual(candidates[0]["spoken_duration_ms"], 500)
+            self.assertEqual(candidates[1]["similarity"], 1.0)
+
+    def test_speech_labels_do_not_treat_removed_silence_as_removed_words(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "val2-sample.screenstudio"
+            project.mkdir()
+            (project / "benchmark-ground-truth.json").write_text(json.dumps({
+                "source_project": "/original/sample.screenstudio",
+                "manual_cut_intervals_ms": [[2000, 5000]],
+            }))
+            (project / "baseline-report.transcript.edit.json").write_text(json.dumps({
+                "segments": [{
+                    "start": 1.0, "end": 2.0, "text": "这句话被保留",
+                    "words": [word("这句话被保留", 1.0, 2.0)],
+                }]
+            }))
+            (project / "structured-edit-candidates-v1.json").write_text(json.dumps({
+                "candidates": [{
+                    "start": 1.0, "end": 5.0,
+                    "planner_category": "abandoned_take",
+                    "detector_type": "possible_isolated_take",
+                    "removed_text": "这句话被保留",
+                }]
+            }))
+
+            result = preference_edit_arbiter.build_preferences(
+                root, candidate_source="structured"
+            )
+
+            self.assertEqual(result["examples"][0]["overlap_fraction"], 0.75)
+            self.assertEqual(result["examples"][0]["speech_overlap_fraction"], 0.0)
+            self.assertEqual(result["examples"][0]["label"], "keep")
+
+    def test_smart_cuts_include_nonoverlapping_local_micro_candidate(self):
+        document = smart_edit_workflow.cuts_document(
+            Path("/tmp/example.screenstudio"),
+            {"project_sha256": "abc"},
+            {"candidates": [{
+                "start_ms": 1000, "end_ms": 2500,
+                "planner_category": "abandoned_take",
+            }]},
+            [
+                {
+                    "start_ms": 1200, "end_ms": 2000,
+                    "detector_type": "possible_tail_restart",
+                },
+                {
+                    "start_ms": 3000, "end_ms": 3600,
+                    "detector_type": "hard_filler",
+                    "spoken_start_ms": 3040, "spoken_end_ms": 3520,
+                },
+            ],
+        )
+        self.assertEqual(len(document["cuts"]), 2)
+        self.assertTrue(document["cuts"][1]["local_micro_decision"])
+        self.assertEqual(document["cuts"][1]["candidate_type"], "hard_filler")
+        self.assertEqual(document["cuts"][1]["spoken_start_ms"], 3040)
+
+    def test_final_audit_cache_requires_exact_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "audit.json"
+            report.write_text(json.dumps({
+                "smart_edit_audit_signature": "current",
+            }))
+
+            self.assertTrue(
+                smart_edit_workflow.final_audit_is_current(report, "current")
+            )
+            self.assertFalse(
+                smart_edit_workflow.final_audit_is_current(report, "changed")
+            )
+
     def test_default_reviews_screen_active_pauses_from_two_seconds(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)

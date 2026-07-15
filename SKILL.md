@@ -81,8 +81,11 @@ For ordinary talking-head/screen-tutorial recordings, the recommended path is
 the cached Gemini-only workflow. It performs the local dry run, builds one
 source-aligned A/V proxy, asks `google/gemini-3.5-flash` for grounded
 whole-timeline candidates, learns the creator's light-editing preference from
-the held-out benchmark examples, and performs a second dry run. It does not
-write the timeline unless `--apply` is explicitly added:
+the held-out benchmark examples, adds a conservative local micro-edit pass,
+and performs a second dry run. The local pass removes only an acoustically
+isolated strong filler lasting at least 400 ms or a short tail take repeated
+almost exactly; ambiguous short fillers and approximate restarts are kept. It
+does not write the timeline unless `--apply` is explicitly added:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
@@ -102,12 +105,20 @@ safe:
 The workflow reads the ZenMux key from `ZENMUX_API_KEY` or
 `~/.zenmux_api_key`; never put a key in the repository or a report. It reuses
 ASR, the aligned proxy, the full-video planner response, and the preference
-decision whenever their fingerprints still match. On a five-project
-leave-one-video-out benchmark, the fully Gemini-only path reached about 97.7%
-time precision and 47.7% coverage of the creator's hand cuts (64.1% time F1);
-the older safe path covered about 30.7%. The Gemini arbitration step took
-roughly 8–12 seconds per benchmark video. Treat those figures as regression
-evidence, not a guarantee for unrelated recording styles.
+decision whenever their fingerprints still match. It also fingerprints the
+project, transcript, cuts, and editor code before the final audit, so an
+unchanged rerun does not repeat the expensive audio/timeline validation. The
+local micro-edit pass does not call an API and normally completes in under a
+second. A final safety
+gate rejects short speech deletions when the model cannot point to a concrete
+repeated or corrected structure; a difficult “maybe retake” stays in the
+video. On a five-project leave-one-video-out benchmark, the selected
+conservative path reached about 98.1% time precision and 50.8% coverage of the
+creator's hand cuts (67.0% time F1); the earlier Gemini path reached about
+97.7% precision, 47.7% coverage, and 64.1% F1, while the older safe path
+covered about 30.7%. The Gemini arbitration step took roughly 8–12 seconds per
+benchmark video. Treat those figures as regression evidence, not a guarantee
+for unrelated recording styles.
 
 For a recording that genuinely needs pause cleanup only, the direct apply path remains:
 

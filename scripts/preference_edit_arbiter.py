@@ -16,15 +16,21 @@ from gemini_edit_candidates import (
     DEFAULT_API_BASE,
     DEFAULT_API_KEY_FILE,
     extract_json_from_text,
+    flatten_words,
     load_transcript,
     post_json,
+    segment_similarity,
     transcript_context,
 )
 from global_edit_planner import file_sha256, grounded_silent_range, transcript_atoms
 
 
-REPORT_NAMES = ("global-video-planner-gemini35flash-v4.json",)
+GLOBAL_REPORT_NAMES = ("global-video-planner-gemini35flash-v4.json",)
+STRUCTURED_REPORT_NAMES = ("structured-edit-candidates-v1.json",)
 DEFAULT_MODEL = "google/gemini-3.5-flash"
+ARBITER_VERSION = 2
+SHORT_SPEECH_GUARD_MAX_MS = 3_500.0
+MIN_SHORT_REPLACEMENT_SIMILARITY = 0.2
 # A pause above this threshold becomes a review hypothesis, not an automatic cut.
 # Five-video leave-one-out validation found 2 s improved recall materially while
 # retaining 97.68% time precision; reviewing every pause diluted the model prompt.
@@ -71,12 +77,32 @@ def automatic_safety_blocker(candidate: dict[str, Any]) -> str | None:
         and float(candidate.get("input_activity_fraction") or 0.0) <= 0.05
     ):
         return "continuous_visual_without_input"
+    if candidate.get("detector_type") in {
+        "possible_isolated_take",
+        "possible_abandoned_sentence",
+    }:
+        return "broad_structural_candidate_requires_manual_review"
+    duration_ms = float(candidate.get("duration_ms") or 0.0)
+    if not duration_ms and candidate.get("start") is not None and candidate.get("end") is not None:
+        duration_ms = (
+            float(candidate["end"]) - float(candidate["start"])
+        ) * 1000.0
+    if (
+        candidate_family(candidate) == "speech"
+        and duration_ms < SHORT_SPEECH_GUARD_MAX_MS
+        and segment_similarity(
+            str(candidate.get("removed_text") or ""),
+            str(candidate.get("kept_text") or ""),
+        ) < MIN_SHORT_REPLACEMENT_SIMILARITY
+    ):
+        return "short_speech_without_structural_replacement"
     return None
 
 
 def candidate_rows(
     project: Path,
     protected_pause_min_ms: float = PROTECTED_PAUSE_MIN_MS,
+    candidate_source: str = "global",
 ) -> list[dict[str, Any]]:
     transcript_path = project / "baseline-report.transcript.edit.json"
     segments = load_transcript(transcript_path)
@@ -85,7 +111,7 @@ def candidate_rows(
     source_rows: list[tuple[str, dict[str, Any]]] = []
     activity_report_path = project / "baseline-report.json"
     activity_report: dict[str, Any] = {}
-    if activity_report_path.exists():
+    if activity_report_path.exists() and candidate_source in {"all", "global"}:
         activity_report = load_json(activity_report_path)
         for pause in activity_report.get("pauses_protected_by_activity") or []:
             if not isinstance(pause, dict):
@@ -105,7 +131,14 @@ def candidate_rows(
                     ),
                 },
             ))
-    for report_name in REPORT_NAMES:
+    report_names = (
+        GLOBAL_REPORT_NAMES + STRUCTURED_REPORT_NAMES
+        if candidate_source == "all"
+        else GLOBAL_REPORT_NAMES
+        if candidate_source == "global"
+        else STRUCTURED_REPORT_NAMES
+    )
+    for report_name in report_names:
         report_path = project / report_name
         if not report_path.exists():
             continue
@@ -164,6 +197,7 @@ def candidate_rows(
 def build_preferences(
     root: Path,
     protected_pause_min_ms: float = PROTECTED_PAUSE_MIN_MS,
+    candidate_source: str = "global",
 ) -> dict[str, Any]:
     examples: list[dict[str, Any]] = []
     for project in sorted(root.glob("val2-*.screenstudio")):
@@ -173,23 +207,68 @@ def build_preferences(
         ground = load_json(ground_path)
         truth = [tuple(item) for item in ground.get("manual_cut_intervals_ms") or []]
         source_project = str(ground.get("source_project") or "")
+        words = flatten_words(
+            load_transcript(project / "baseline-report.transcript.edit.json")
+        )
         for index, candidate in enumerate(
-            candidate_rows(project, protected_pause_min_ms), start=1
+            candidate_rows(project, protected_pause_min_ms, candidate_source), start=1
         ):
             interval = [(candidate["start"] * 1000.0, candidate["end"] * 1000.0)]
             duration = interval[0][1] - interval[0][0]
-            fraction = intersection_duration(interval, truth) / duration if duration else 0.0
-            label = "cut" if fraction >= 0.7 else "keep" if fraction <= 0.3 else "partial"
+            range_fraction = (
+                intersection_duration(interval, truth) / duration if duration else 0.0
+            )
+            speech_intervals = [
+                (
+                    max(interval[0][0], float(word["start"]) * 1000.0),
+                    min(interval[0][1], float(word["end"]) * 1000.0),
+                )
+                for word in words
+                if float(word["end"]) * 1000.0 > interval[0][0]
+                and float(word["start"]) * 1000.0 < interval[0][1]
+            ]
+            speech_duration = sum(end - start for start, end in speech_intervals)
+            speech_fraction = (
+                intersection_duration(speech_intervals, truth) / speech_duration
+                if speech_duration
+                else None
+            )
+            if candidate_family(candidate) == "screen_pause" or speech_fraction is None:
+                label = (
+                    "cut"
+                    if range_fraction >= 0.7
+                    else "keep"
+                    if range_fraction <= 0.3
+                    else "partial"
+                )
+            elif range_fraction >= 0.7 and speech_fraction >= 0.7:
+                label = "cut"
+            elif range_fraction <= 0.3 or speech_fraction <= 0.3:
+                label = "keep"
+            else:
+                label = "partial"
             examples.append({
                 "id": f"example_{len(examples) + 1:03d}",
                 "source_project": source_project,
                 "candidate_index": index,
                 "label": label,
-                "overlap_fraction": round(fraction, 5),
+                "overlap_fraction": round(range_fraction, 5),
+                "range_overlap_fraction": round(range_fraction, 5),
+                "speech_overlap_fraction": (
+                    round(speech_fraction, 5)
+                    if speech_fraction is not None
+                    else None
+                ),
                 "category": candidate.get("planner_category"),
+                "detector_type": candidate.get("detector_type") or "global_planner",
                 "duration_s": round(candidate["end"] - candidate["start"], 3),
                 "removed_text": candidate.get("removed_text") or "",
+                "kept_text": candidate.get("kept_text") or "",
                 "planner_reason": candidate.get("planner_reason") or "",
+                "similarity": candidate.get("similarity"),
+                "restart_similarity": candidate.get("restart_similarity"),
+                "repair_marker": candidate.get("repair_marker"),
+                "local_acoustic_safe": bool(candidate.get("local_acoustic_safe")),
                 "visual_activity_fraction": candidate.get("visual_activity_fraction", 0.0),
                 "input_activity_fraction": candidate.get("input_activity_fraction", 0.0),
                 "context": candidate.get("context") or "",
@@ -198,6 +277,7 @@ def build_preferences(
         json.dumps(
             {
                 "protected_pause_min_ms": protected_pause_min_ms,
+                "candidate_source": candidate_source,
                 "examples": examples,
             },
             ensure_ascii=False,
@@ -208,6 +288,7 @@ def build_preferences(
         "schema_version": 1,
         "source": "creator hand-edited Screen Studio benchmarks",
         "protected_pause_min_ms": protected_pause_min_ms,
+        "candidate_source": candidate_source,
         "signature": signature,
         "example_count": len(examples),
         "examples": examples,
@@ -215,9 +296,11 @@ def build_preferences(
 
 
 def target_candidates(
-    project: Path, protected_pause_min_ms: float = PROTECTED_PAUSE_MIN_MS
+    project: Path,
+    protected_pause_min_ms: float = PROTECTED_PAUSE_MIN_MS,
+    candidate_source: str = "global",
 ) -> list[dict[str, Any]]:
-    candidates = candidate_rows(project, protected_pause_min_ms)
+    candidates = candidate_rows(project, protected_pause_min_ms, candidate_source)
     for index, candidate in enumerate(candidates, start=1):
         candidate["id"] = f"target_{index:03d}"
     return candidates
@@ -228,25 +311,39 @@ def prompt_for_arbitration(
     candidates: list[dict[str, Any]],
     *,
     video_supplied: bool = False,
+    candidate_source: str = "global",
 ) -> str:
+    example_keys = [
+        "label",
+        "category",
+        "duration_s",
+        "removed_text",
+        "planner_reason",
+        "visual_activity_fraction",
+        "input_activity_fraction",
+        "context",
+    ]
+    if candidate_source in {"structured", "all"}:
+        example_keys.extend([
+            "detector_type",
+            "kept_text",
+            "similarity",
+            "restart_similarity",
+            "repair_marker",
+            "local_acoustic_safe",
+            "range_overlap_fraction",
+            "speech_overlap_fraction",
+        ])
     compact_examples = [
         {
             key: example.get(key)
-            for key in (
-                "label",
-                "category",
-                "duration_s",
-                "removed_text",
-                "planner_reason",
-                "visual_activity_fraction",
-                "input_activity_fraction",
-                "context",
-            )
+            for key in example_keys
         }
         for example in examples
     ]
-    compact_targets = [
-        {
+    compact_targets = []
+    for candidate in candidates:
+        target = {
             "id": candidate["id"],
             "category": candidate.get("planner_category"),
             "duration_s": round(candidate["end"] - candidate["start"], 3),
@@ -256,8 +353,16 @@ def prompt_for_arbitration(
             "input_activity_fraction": candidate.get("input_activity_fraction", 0.0),
             "context": candidate.get("context") or "",
         }
-        for candidate in candidates
-    ]
+        if candidate_source in {"structured", "all"}:
+            target.update({
+                "detector_type": candidate.get("detector_type"),
+                "kept_text": candidate.get("kept_text") or "",
+                "similarity": candidate.get("similarity"),
+                "restart_similarity": candidate.get("restart_similarity"),
+                "repair_marker": candidate.get("repair_marker"),
+                "local_acoustic_safe": bool(candidate.get("local_acoustic_safe")),
+            })
+        compact_targets.append(target)
     schema = {
         "decisions": [
             {
@@ -268,6 +373,21 @@ def prompt_for_arbitration(
             }
         ]
     }
+    speech_label_note = ""
+    structured_note = ""
+    if candidate_source in {"structured", "all"}:
+        speech_label_note = """For speech candidates, cut also means that the creator removed the spoken
+words themselves, not merely a long silence inside the proposed range.
+range_overlap_fraction describes the complete interval; speech_overlap_fraction
+describes recognized speech only. Low speech overlap is strong keep evidence
+even when a surrounding pause makes range overlap look high."""
+        structured_note = """Structured detector evidence is also only a hypothesis. For duplicate or
+abandoned takes, compare removed_text with kept_text and require the later take
+to preserve every useful claim. A repair_marker by itself is not a correction.
+For isolated_filler, local_acoustic_safe means the splice is technically clean,
+not that this creator necessarily wants that filler removed. A normal topic
+transition is not a retake: if kept_text changes subject instead of restating
+removed_text, keep the candidate."""
     return f"""
 You are learning one creator's PERSONAL talking-head editing style from labeled
 examples. Decide the target candidates in the same style. The labels mean:
@@ -275,7 +395,7 @@ examples. Decide the target candidates in the same style. The labels mean:
 - keep: the creator intentionally retained it;
 - partial: only part of the proposed range was removed, so the broad range is
   unsafe for automatic deletion.
-
+{speech_label_note}
 {"A complete source-timeline-aligned video with microphone audio is attached. Inspect the actual screen state, delivery, and full sequence before deciding." if video_supplied else "No video is attached to this pass; use the grounded transcript context."}
 
 Important preferences to infer from examples:
@@ -294,7 +414,7 @@ removed_text and surrounding context. A sentence that continues grammatically
 after a pause is not an abandoned take. A result showcase or invited reading
 pause is content. Return cut/high only when the creator's examples strongly
 support removing the complete proposed range; otherwise keep or review.
-
+{structured_note}
 Judge the targets as one timeline, not as unrelated snippets. If a cluster of
 screen pauses follows an instruction to pause, read, compare, inspect, score,
 or watch a sequence of outputs, preserve the entire showcase cluster even when
@@ -325,19 +445,41 @@ def response_text(response: dict[str, Any]) -> str:
 
 def arbitrate(args: argparse.Namespace) -> None:
     preferences = load_json(args.preferences)
-    ground = load_json(args.project / "benchmark-ground-truth.json")
-    source_project = str(ground.get("source_project") or "")
+    ground_path = args.project / "benchmark-ground-truth.json"
+    source_project = (
+        str(load_json(ground_path).get("source_project") or "")
+        if ground_path.exists()
+        else str(args.project.resolve())
+    )
+    candidate_source = (
+        args.candidate_source
+        or str(preferences.get("candidate_source") or "global")
+    )
     examples = [
         item
         for item in preferences.get("examples") or []
         if item.get("source_project") != source_project
+        and (
+            candidate_source == "all"
+            or (
+                candidate_source == "global"
+                and item.get("detector_type", "global_planner")
+                == "global_planner"
+            )
+            or (
+                candidate_source == "structured"
+                and item.get("detector_type") != "global_planner"
+            )
+        )
     ]
     protected_pause_min_ms = (
         args.protected_pause_min_ms
         if args.protected_pause_min_ms is not None
         else float(preferences.get("protected_pause_min_ms", PROTECTED_PAUSE_MIN_MS))
     )
-    candidates = target_candidates(args.project, protected_pause_min_ms)
+    candidates = target_candidates(
+        args.project, protected_pause_min_ms, candidate_source
+    )
     candidate_signature = hashlib.sha256(
         json.dumps(candidates, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -350,14 +492,44 @@ def arbitrate(args: argparse.Namespace) -> None:
         cached = load_json(args.output)
         if (
             cached.get("model") == args.model
+            and cached.get("arbiter_version") == ARBITER_VERSION
+            and cached.get("candidate_source") == candidate_source
             and cached.get("preference_signature") == preferences.get("signature")
             and cached.get("candidate_signature") == candidate_signature
             and cached.get("video_sha256") == video_sha256
         ):
             print(json.dumps(cached, ensure_ascii=False, indent=2))
             return
+    if not candidates:
+        output = {
+            "schema_version": 1,
+            "arbiter_version": ARBITER_VERSION,
+            "project": str(args.project),
+            "source_project": source_project,
+            "transcript": str(args.project / "baseline-report.transcript.edit.json"),
+            "model": args.model,
+            "candidate_source": candidate_source,
+            "video": str(args.video) if args.video else None,
+            "video_sha256": video_sha256,
+            "preference_signature": preferences.get("signature"),
+            "protected_pause_min_ms": protected_pause_min_ms,
+            "candidate_signature": candidate_signature,
+            "training_examples": len(examples),
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "safety_blocked_count": 0,
+            "decisions": [],
+            "candidates": [],
+            "usage": None,
+        }
+        write_json(args.output, output)
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return
     prompt = prompt_for_arbitration(
-        examples, candidates, video_supplied=bool(args.video)
+        examples,
+        candidates,
+        video_supplied=bool(args.video),
+        candidate_source=candidate_source,
     )
     user_content: str | list[dict[str, Any]] = prompt
     if args.video:
@@ -376,6 +548,7 @@ def arbitrate(args: argparse.Namespace) -> None:
         ]
     payload = {
         "model": args.model,
+        "candidate_source": candidate_source,
         "messages": [
             {"role": "system", "content": "You are a conservative personalized video editor. Return strict JSON only."},
             {"role": "user", "content": user_content},
@@ -420,10 +593,12 @@ def arbitrate(args: argparse.Namespace) -> None:
             accepted.append(candidate)
     output = {
         "schema_version": 1,
+        "arbiter_version": ARBITER_VERSION,
         "project": str(args.project),
         "source_project": source_project,
         "transcript": str(args.project / "baseline-report.transcript.edit.json"),
         "model": args.model,
+        "candidate_source": candidate_source,
         "video": str(args.video) if args.video else None,
         "video_sha256": video_sha256,
         "preference_signature": preferences.get("signature"),
@@ -452,6 +627,11 @@ def parse_args() -> argparse.Namespace:
     build.add_argument(
         "--protected-pause-min-ms", type=float, default=PROTECTED_PAUSE_MIN_MS
     )
+    build.add_argument(
+        "--candidate-source",
+        choices=("all", "global", "structured"),
+        default="global",
+    )
     decide = subparsers.add_parser("decide")
     decide.add_argument("--project", type=Path, required=True)
     decide.add_argument("--preferences", type=Path, required=True)
@@ -463,6 +643,9 @@ def parse_args() -> argparse.Namespace:
     decide.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE)
     decide.add_argument("--timeout", type=int, default=300)
     decide.add_argument("--protected-pause-min-ms", type=float)
+    decide.add_argument(
+        "--candidate-source", choices=("all", "global", "structured")
+    )
     decide.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -470,7 +653,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.command == "build":
-        preferences = build_preferences(args.root, args.protected_pause_min_ms)
+        preferences = build_preferences(
+            args.root, args.protected_pause_min_ms, args.candidate_source
+        )
         write_json(args.output, preferences)
         print(json.dumps(preferences, ensure_ascii=False, indent=2))
     else:
