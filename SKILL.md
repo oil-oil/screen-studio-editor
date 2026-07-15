@@ -78,14 +78,17 @@ Start with a dry run. It performs the complete ASR/audio/activity/candidate anal
 Read the audit report yourself. Check every protected interval, every reviewed cut, all removals over 5 seconds, and whether the projected time saved is plausible. A first dry run caches its source-time editing transcript beside the report (the exact path is in `edit_transcript_cache`), so reuse it and avoid paying for ASR twice.
 
 For ordinary talking-head/screen-tutorial recordings, the recommended path is
-the cached Gemini-only workflow. It performs the local dry run, builds one
-source-aligned A/V proxy, asks `google/gemini-3.5-flash` for grounded
-whole-timeline candidates, learns the creator's light-editing preference from
-the held-out benchmark examples, and lets the same personalized arbitration
-call inspect the aligned video before it clears any screen-active cut. The
-arbiter must describe the visible action and classify it as meaningful or
-redundant; click/keystroke telemetry constrains the allowed answer and remains
-the stricter final guard. The workflow also adds a conservative local
+the cached Gemini-only workflow. It performs the local dry run with a personal
+1,000 ms conservative pause gate, builds one source-aligned A/V proxy, asks
+`google/gemini-3.5-flash` for grounded whole-timeline candidates, and runs a
+second cheap text-only pass that exposes Screen Studio's real pause/resume
+session boundaries so an abandoned complete take is not hidden inside the
+concatenated proxy. It learns the creator's light-editing preference from the
+held-out benchmark examples and lets the same personalized arbitration call
+inspect the aligned video before it clears any screen-active or session-aware
+cut. The arbiter must describe the visible action and classify it as meaningful
+or redundant; click/keystroke telemetry constrains the allowed answer and
+remains the stricter final guard. The workflow also adds a conservative local
 micro-edit pass and performs a second dry run. The local pass removes only an
 acoustically isolated strong filler lasting at least 400 ms or a short tail
 take repeated almost exactly; ambiguous short fillers and approximate
@@ -109,22 +112,28 @@ safe:
 
 The workflow reads the ZenMux key from `ZENMUX_API_KEY` or
 `~/.zenmux_api_key`; never put a key in the repository or a report. It reuses
-ASR, the aligned proxy, the full-video planner response, and the preference
-decision whenever their fingerprints still match. It also fingerprints the
-project, transcript, cuts, and editor code before the final audit, so an
-unchanged rerun does not repeat the expensive audio/timeline validation. The
-local micro-edit pass does not call an API and normally completes in under a
-second. A final safety
+ASR, the aligned proxy, the full-video and session-aware planner responses, and
+the preference decision whenever their fingerprints still match. It also
+fingerprints the project, transcript, cuts, and editor code before the final
+audit, so an unchanged rerun does not repeat the expensive audio/timeline
+validation. The local micro-edit pass does not call an API and normally
+completes in under a second. A final safety
 gate rejects short speech deletions when the model cannot point to a concrete
 repeated or corrected structure; a difficult “maybe retake” stays in the
 video. A fresh five-project July regression measured the cuts that survived
 the final activity guard at about 98.2% time precision and 53.7% coverage of
 the creator's hand cuts (69.4% time F1). Five additional, previously unseen
-June projects reached about 98.2% precision and 79.9% coverage (88.1% F1).
-First-time end-to-end analysis took roughly 1.5–5 minutes per 5–11 minute
-multi-session benchmark project; an unchanged cached rerun took about
-0.5–0.6 seconds. Treat those figures as regression evidence, not a guarantee
-for unrelated recording styles.
+June projects reached about 98.2% precision and 79.9% coverage (88.1% F1). A
+harder five-video April/May holdout with 1–9 recording sessions reached 90.4%
+precision and 29.4% coverage (44.4% F1); the unique cuts added by the
+session-aware layer were 96.0% precise. On a 15-session abandoned-take stress
+case, the layer raised coverage from 23.3% to 57.4% while precision moved from
+92.0% to 90.0%. It did not solve subjective long removals inside a single
+continuous session. First-time end-to-end analysis took roughly 3–10.5 minutes
+for the 5–23 minute historical benchmarks; the extra session pass itself
+normally took only 10–20 seconds and about 10k–13k text tokens. An unchanged
+cached rerun previously measured about 0.5–0.6 seconds. Treat all figures as
+regression evidence, not a guarantee for unrelated recording styles.
 
 For a recording that genuinely needs pause cleanup only, the direct apply path remains:
 

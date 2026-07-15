@@ -8,6 +8,7 @@ import unittest
 import wave
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ import editing_core
 import benchmark_autoedit
 import gemini_edit_candidates as candidates
 import global_edit_planner
+import session_edit_planner
 import consensus_edit_candidates
 import preference_edit_arbiter
 import structured_edit_candidates
@@ -714,6 +716,98 @@ class CandidateRecallTests(unittest.TestCase):
 
 
 class PreferenceArbiterTests(unittest.TestCase):
+    def test_arbiter_retries_one_empty_structured_response(self):
+        responses = [
+            {"choices": [{"message": {"content": ""}}]},
+            {"choices": [{"message": {"content": '{"decisions": []}'}}]},
+        ]
+        with mock.patch.object(
+            preference_edit_arbiter,
+            "post_json",
+            side_effect=responses,
+        ) as post:
+            response, parsed = preference_edit_arbiter.request_arbitration(
+                "https://example.invalid", {}, "secret", 30
+            )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(parsed, {"decisions": []})
+        self.assertEqual(response, responses[1])
+
+    def test_arbiter_fallback_separates_speech_and_screen_pauses(self):
+        batches = preference_edit_arbiter.fallback_candidate_batches([
+            {"id": "speech", "planner_category": "abandoned_take"},
+            {"id": "pause", "planner_category": "screen_pause"},
+            {"id": "speech2", "planner_category": "duplicate_take"},
+        ])
+
+        self.assertEqual(
+            [[item["id"] for item in batch] for batch in batches],
+            [["speech", "speech2"], ["pause"]],
+        )
+
+    def test_session_planner_exposes_real_recording_boundaries(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "第一遍"},
+            {"id": "U0002", "start": 6.0, "end": 7.0, "text": "第二遍"},
+        ]
+        sessions = [
+            {"id": "S01", "start": 0.0, "end": 5.0},
+            {"id": "S02", "start": 5.0, "end": 10.0},
+        ]
+
+        rows = session_edit_planner.transcript_rows(atoms, sessions)
+        prompt = session_edit_planner.build_prompt(atoms, sessions)
+
+        self.assertIn("=== SESSION S01 0.000-5.000 ===", rows)
+        self.assertIn("[U0002 S02 6.000-7.000] 第二遍", rows)
+        self.assertIn("whole session", prompt)
+
+    def test_session_intervals_use_cumulative_source_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            recording = project / "recording"
+            recording.mkdir()
+            (recording / "metadata.json").write_text(json.dumps({
+                "recorders": [{
+                    "type": "microphone",
+                    "sessions": [
+                        {"durationMs": 2500, "processTimeStartMs": 100},
+                        {"durationMs": 4000, "processTimeStartMs": 5000},
+                    ],
+                }],
+            }))
+
+            sessions = session_edit_planner.session_intervals(project)
+
+            self.assertEqual(sessions, [
+                {"id": "S01", "start": 0.0, "end": 2.5},
+                {"id": "S02", "start": 2.5, "end": 6.5},
+            ])
+
+    def test_preference_arbiter_loads_long_session_hypothesis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "baseline-report.transcript.edit.json").write_text(
+                json.dumps({"segments": [
+                    {"start": 0.0, "end": 200.0, "text": "较长的失败录制"},
+                ]})
+            )
+            (project / "session-text-planner-gemini35flash-v1.json").write_text(
+                json.dumps({"candidates": [{
+                    "start": 5.0,
+                    "end": 185.0,
+                    "planner_category": "abandoned_take",
+                    "removed_text": "较长的失败录制",
+                    "kept_text": "后续干净版本",
+                }]})
+            )
+
+            rows = preference_edit_arbiter.candidate_rows(project)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["duration_ms"], 180_000)
+
     def test_short_speech_needs_structural_replacement_before_auto_cut(self):
         unrelated = {
             "start": 10.0,
@@ -865,6 +959,18 @@ class PreferenceArbiterTests(unittest.TestCase):
             cut["visual_assessment"], "Only a loading spinner changes."
         )
 
+    def test_smart_cut_preserves_candidate_provenance(self):
+        cut = smart_edit_workflow.candidate_cut({
+            "start_ms": 1000,
+            "end_ms": 5000,
+            "planner_category": "abandoned_take",
+            "source_report": "session-text-planner-gemini35flash-v1.json",
+        })
+        self.assertEqual(
+            cut["source_report"],
+            "session-text-planner-gemini35flash-v1.json",
+        )
+
     def test_final_audit_cache_requires_exact_signature(self):
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "audit.json"
@@ -957,6 +1063,12 @@ class PreferenceArbiterTests(unittest.TestCase):
 
 
 class BailianReviewerTests(unittest.TestCase):
+    def test_json_extractor_ignores_text_after_first_complete_object(self):
+        parsed = candidates.extract_json_from_text(
+            '{"decisions": []}\nAdditional non-JSON explanation.'
+        )
+        self.assertEqual(parsed, {"decisions": []})
+
     def test_visual_pause_is_narrowed_to_transcript_grounded_silence(self):
         atoms = [
             {"id": "U0001", "start": 1.0, "end": 3.0, "text": "前一句"},

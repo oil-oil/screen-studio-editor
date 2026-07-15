@@ -14,7 +14,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = "google/gemini-3.5-flash"
-WORKFLOW_VERSION = 2
+WORKFLOW_VERSION = 3
 DEFAULT_PREFERENCES = Path(
     "~/Screen Studio Projects/AutoEdit Benchmarks/creator-edit-preferences.json"
 ).expanduser()
@@ -56,7 +56,7 @@ def final_audit_signature(
         "cuts_sha256": file_sha256(cuts_path),
         "transcript_sha256": file_sha256(transcript),
         "process_sha256": file_sha256(SCRIPT_DIR / "process.py"),
-        "pause_threshold_ms": 800,
+        "pause_threshold_ms": 1000,
         "min_pause_ms": 300,
         "pause_source": "silence",
     }
@@ -111,7 +111,7 @@ def candidate_cut(candidate: dict[str, Any], *, local: bool = False) -> dict[str
     for key in ("spoken_start_ms", "spoken_end_ms"):
         if candidate.get(key) is not None:
             cut[key] = candidate[key]
-    for key in ("screen_action", "visual_assessment"):
+    for key in ("screen_action", "visual_assessment", "source_report"):
         if candidate.get(key):
             cut[key] = candidate[key]
     if local:
@@ -179,6 +179,8 @@ def main() -> None:
     transcript = project / "baseline-report.transcript.edit.json"
     planner_report = project / "global-video-planner-gemini35flash-v4.json"
     planner_work = project / "global-video-work-gemini35flash-v4"
+    session_report = project / "session-text-planner-gemini35flash-v1.json"
+    session_work = project / "session-text-work-gemini35flash-v1"
     structured_report = project / "structured-edit-candidates-v1.json"
     arbiter_report = project / "smart-edit-report.json"
     cuts_path = project / "smart-edit-cuts.json"
@@ -192,7 +194,7 @@ def main() -> None:
                 sys.executable,
                 str(SCRIPT_DIR / "process.py"),
                 "--project", str(project),
-                "--pause-threshold", "800",
+                "--pause-threshold", "1000",
                 "--min-pause", "300",
                 "--pause-source", "silence",
                 "--asr-backend", "bailian",
@@ -236,6 +238,19 @@ def main() -> None:
     run(
         [
             sys.executable,
+            str(SCRIPT_DIR / "session_edit_planner.py"),
+            "--project", str(project),
+            "--transcript", str(transcript),
+            "--output", str(session_report),
+            "--work-dir", str(session_work),
+            "--model", args.model,
+            "--resume",
+        ],
+        "Gemini session-aware transcript paper edit",
+    )
+    run(
+        [
+            sys.executable,
             str(SCRIPT_DIR / "preference_edit_arbiter.py"),
             "decide",
             "--project", str(project),
@@ -264,7 +279,7 @@ def main() -> None:
         "--project", str(project),
         "--skip-transcribe", str(transcript),
         "--cuts-file", str(cuts_path),
-        "--pause-threshold", "800",
+        "--pause-threshold", "1000",
         "--min-pause", "300",
         "--pause-source", "silence",
         "--asr-backend", "bailian",
@@ -292,6 +307,7 @@ def main() -> None:
         "model": args.model,
         "applied": args.apply,
         "planner_candidates": load_json(planner_report).get("candidate_count"),
+        "session_candidates": load_json(session_report).get("candidate_count"),
         "structured_candidates": load_json(structured_report).get("candidate_count"),
         "local_micro_cuts": sum(
             bool(item.get("local_micro_decision"))

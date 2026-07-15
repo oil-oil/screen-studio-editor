@@ -1772,12 +1772,13 @@ def extract_json_from_text(text: str) -> dict[str, Any]:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
     if fenced:
         text = fenced.group(1)
-    else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-    return json.loads(text)
+    start = text.find("{")
+    if start >= 0:
+        text = text[start:]
+    value, _end = json.JSONDecoder().raw_decode(text)
+    if not isinstance(value, dict):
+        raise ValueError("Structured model response is not a JSON object.")
+    return value
 
 
 def placeholder_decisions(candidates: list[dict[str, Any]], note: str) -> dict[str, Any]:

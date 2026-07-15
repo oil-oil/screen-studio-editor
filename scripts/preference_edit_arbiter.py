@@ -25,7 +25,10 @@ from gemini_edit_candidates import (
 from global_edit_planner import file_sha256, grounded_silent_range, transcript_atoms
 
 
-GLOBAL_REPORT_NAMES = ("global-video-planner-gemini35flash-v4.json",)
+GLOBAL_REPORT_NAMES = (
+    "global-video-planner-gemini35flash-v4.json",
+    "session-text-planner-gemini35flash-v1.json",
+)
 STRUCTURED_REPORT_NAMES = ("structured-edit-candidates-v1.json",)
 DEFAULT_MODEL = "google/gemini-3.5-flash"
 ARBITER_VERSION = 6
@@ -35,6 +38,7 @@ MIN_SHORT_REPLACEMENT_SIMILARITY = 0.25
 # Five-video leave-one-out validation found 2 s improved recall materially while
 # retaining 97.68% time precision; reviewing every pause diluted the model prompt.
 PROTECTED_PAUSE_MIN_MS = 2_000.0
+MAX_GLOBAL_CANDIDATE_SECONDS = 300.0
 
 
 def load_json(path: Path) -> Any:
@@ -163,7 +167,11 @@ def candidate_rows(
             end = float(raw["end"])
         except (KeyError, TypeError, ValueError):
             continue
-        if start < 0.0 or end <= start or end - start > 120.0:
+        if (
+            start < 0.0
+            or end <= start
+            or end - start > MAX_GLOBAL_CANDIDATE_SECONDS
+        ):
             continue
         row = dict(raw)
         if candidate_family(row) == "screen_pause":
@@ -464,6 +472,87 @@ def response_text(response: dict[str, Any]) -> str:
     return content
 
 
+def request_arbitration(
+    url: str,
+    payload: dict[str, Any],
+    key: str,
+    timeout: int,
+    *,
+    attempts: int = 2,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Retry one transient empty or malformed structured response."""
+    last_error: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        response = post_json(url, payload, key, timeout)
+        try:
+            parsed = extract_json_from_text(response_text(response))
+            if not isinstance(parsed, dict):
+                raise ValueError("Arbiter response JSON is not an object.")
+            return response, parsed
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            last_error = error
+    assert last_error is not None
+    raise last_error
+
+
+def fallback_candidate_batches(
+    candidates: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Separate speech from screen pauses after an oversized response fails."""
+    speech = [item for item in candidates if candidate_family(item) == "speech"]
+    pauses = [item for item in candidates if candidate_family(item) == "screen_pause"]
+    batches = [items for items in (speech, pauses) if items]
+    if len(batches) > 1:
+        return batches
+    midpoint = max(1, len(candidates) // 2)
+    return [
+        items
+        for items in (candidates[:midpoint], candidates[midpoint:])
+        if items
+    ]
+
+
+def arbitration_payload(
+    model: str,
+    candidate_source: str,
+    prompt: str,
+    *,
+    video_name: str | None = None,
+    video_data_url: str | None = None,
+) -> dict[str, Any]:
+    user_content: str | list[dict[str, Any]] = prompt
+    if video_name and video_data_url:
+        user_content = [
+            {
+                "type": "file",
+                "file": {
+                    "file_data": video_data_url,
+                    "filename": video_name,
+                },
+            },
+            {"type": "text", "text": prompt},
+        ]
+    payload: dict[str, Any] = {
+        "model": model,
+        "candidate_source": candidate_source,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative personalized video editor. "
+                    "Return strict JSON only."
+                ),
+            },
+            {"role": "user", "content": user_content},
+        ],
+        "max_completion_tokens": 12_000,
+        "response_format": {"type": "json_object"},
+    }
+    if not model.startswith("anthropic/"):
+        payload["temperature"] = 0
+    return payload
+
+
 def arbitrate(args: argparse.Namespace) -> None:
     preferences = load_json(args.preferences)
     ground_path = args.project / "benchmark-ground-truth.json"
@@ -546,46 +635,52 @@ def arbitrate(args: argparse.Namespace) -> None:
         write_json(args.output, output)
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return
-    prompt = prompt_for_arbitration(
-        examples,
-        candidates,
-        video_supplied=bool(args.video),
-        candidate_source=candidate_source,
+    video_data_url = (
+        "data:video/mp4;base64,"
+        + base64.b64encode(args.video.read_bytes()).decode("ascii")
+        if args.video
+        else None
     )
-    user_content: str | list[dict[str, Any]] = prompt
-    if args.video:
-        user_content = [
-            {
-                "type": "file",
-                "file": {
-                    "file_data": (
-                        "data:video/mp4;base64,"
-                        + base64.b64encode(args.video.read_bytes()).decode("ascii")
-                    ),
-                    "filename": args.video.name,
-                },
-            },
-            {"type": "text", "text": prompt},
-        ]
-    payload = {
-        "model": args.model,
-        "candidate_source": candidate_source,
-        "messages": [
-            {"role": "system", "content": "You are a conservative personalized video editor. Return strict JSON only."},
-            {"role": "user", "content": user_content},
-        ],
-        "max_completion_tokens": 12_000,
-        "response_format": {"type": "json_object"},
-    }
-    if not args.model.startswith("anthropic/"):
-        payload["temperature"] = 0
-    response = post_json(
-        f"{args.api_base.rstrip('/')}/chat/completions",
-        payload,
-        api_key(args),
-        args.timeout,
-    )
-    parsed = extract_json_from_text(response_text(response))
+    endpoint = f"{args.api_base.rstrip('/')}/chat/completions"
+    arbiter_key = api_key(args)
+
+    def payload_for(items: list[dict[str, Any]]) -> dict[str, Any]:
+        prompt = prompt_for_arbitration(
+            examples,
+            items,
+            video_supplied=bool(args.video),
+            candidate_source=candidate_source,
+        )
+        return arbitration_payload(
+            args.model,
+            candidate_source,
+            prompt,
+            video_name=args.video.name if args.video else None,
+            video_data_url=video_data_url,
+        )
+
+    try:
+        response, parsed = request_arbitration(
+            endpoint,
+            payload_for(candidates),
+            arbiter_key,
+            args.timeout,
+            attempts=1 if len(candidates) >= 30 else 2,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        batch_decisions: list[dict[str, Any]] = []
+        batch_usage: list[dict[str, Any] | None] = []
+        for batch in fallback_candidate_batches(candidates):
+            batch_response, batch_parsed = request_arbitration(
+                endpoint,
+                payload_for(batch),
+                arbiter_key,
+                args.timeout,
+            )
+            batch_decisions.extend(batch_parsed.get("decisions") or [])
+            batch_usage.append(batch_response.get("usage"))
+        response = {"usage": {"fallback_batches": batch_usage}}
+        parsed = {"decisions": batch_decisions}
     by_id = {item["id"]: item for item in candidates}
     decisions = []
     accepted = []
