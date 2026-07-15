@@ -235,3 +235,58 @@ def protect_cuts_with_activity(
         else:
             rejected.append({**cut, "activity_overlap_ms": overlap})
     return protected, rejected
+
+
+def protect_reviewed_cuts_with_activity(
+    cuts: list[dict[str, Any]],
+    input_intervals: list[tuple[float, float]],
+    visual_intervals: list[tuple[float, float]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Protect activity unless a multimodal reviewer explicitly clears it.
+
+    A multimodal reviewer can distinguish a harmless cursor blink or redundant
+    UI animation from a unique tutorial action, while a coarse scene detector
+    cannot. Clicks and keystrokes remain hard blockers. Visual-only overlap is
+    bypassed only when the reviewed cut explicitly says the screen action was
+    ``none`` or ``redundant``. Input is stricter: ``none`` conflicts with the
+    event log and stays protected, while ``redundant`` plus a written visual
+    assessment can clear setup/navigation that the final tutorial does not need.
+    """
+    input_cleared: list[dict[str, Any]] = []
+    input_guarded: list[dict[str, Any]] = []
+    for cut in cuts:
+        redundant = str(cut.get("screen_action") or "").strip().lower() == "redundant"
+        assessed = bool(str(cut.get("visual_assessment") or "").strip())
+        (input_cleared if redundant and assessed else input_guarded).append(cut)
+    input_safe, input_rejected = protect_cuts_with_activity(input_guarded, input_intervals)
+    input_rejected = [
+        {**cut, "activity_source": "input"} for cut in input_rejected
+    ]
+    _, input_overrides = protect_cuts_with_activity(input_cleared, input_intervals)
+    input_overrides = [
+        {**cut, "activity_source": "input", "clearance": "redundant"}
+        for cut in input_overrides
+    ]
+    input_safe.extend(input_cleared)
+
+    cleared: list[dict[str, Any]] = []
+    guarded: list[dict[str, Any]] = []
+    for cut in input_safe:
+        screen_action = str(cut.get("screen_action") or "").strip().lower()
+        (cleared if screen_action in {"none", "redundant"} else guarded).append(cut)
+
+    guarded_safe, visual_rejected = protect_cuts_with_activity(guarded, visual_intervals)
+    visual_rejected = [
+        {**cut, "activity_source": "visual"} for cut in visual_rejected
+    ]
+    _, visual_overrides = protect_cuts_with_activity(cleared, visual_intervals)
+    visual_overrides = [
+        {**cut, "activity_source": "visual", "clearance": cut.get("screen_action")}
+        for cut in visual_overrides
+    ]
+    kept = sorted(cleared + guarded_safe, key=lambda item: (item["start_ms"], item["end_ms"]))
+    rejected = sorted(
+        input_rejected + visual_rejected,
+        key=lambda item: (item["start_ms"], item["end_ms"]),
+    )
+    return kept, rejected, input_overrides + visual_overrides

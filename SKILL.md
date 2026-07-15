@@ -75,7 +75,40 @@ Start with a dry run. It performs the complete ASR/audio/activity/candidate anal
   --report-output "/tmp/screenstudio-autoedit-report.json"
 ```
 
-Read the audit report yourself. Check every protected interval, every reviewed cut, all removals over 5 seconds, and whether the projected time saved is plausible. A first dry run caches its source-time editing transcript beside the report (the exact path is in `edit_transcript_cache`), so reuse it and avoid paying for ASR twice. Then run without `--dry-run`:
+Read the audit report yourself. Check every protected interval, every reviewed cut, all removals over 5 seconds, and whether the projected time saved is plausible. A first dry run caches its source-time editing transcript beside the report (the exact path is in `edit_transcript_cache`), so reuse it and avoid paying for ASR twice.
+
+For ordinary talking-head/screen-tutorial recordings, the recommended path is
+the cached Gemini-only workflow. It performs the local dry run, builds one
+source-aligned A/V proxy, asks `google/gemini-3.5-flash` for grounded
+whole-timeline candidates, learns the creator's light-editing preference from
+the held-out benchmark examples, and performs a second dry run. It does not
+write the timeline unless `--apply` is explicitly added:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+  --project "/path/to/Project.screenstudio"
+```
+
+Read `smart-edit-final-report.json`, inspect every smart cut and every removal
+over five seconds, then apply the exact cached decisions only when the audit is
+safe:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+  --project "/path/to/Project.screenstudio" \
+  --apply
+```
+
+The workflow reads the ZenMux key from `ZENMUX_API_KEY` or
+`~/.zenmux_api_key`; never put a key in the repository or a report. It reuses
+ASR, the aligned proxy, the full-video planner response, and the preference
+decision whenever their fingerprints still match. On a five-project
+leave-one-video-out benchmark, the fully Gemini-only path reached about 98.0%
+time precision and 42.6% coverage of the creator's hand cuts; the older safe
+path covered about 30.7%. Treat those figures as regression evidence, not a
+guarantee for unrelated recording styles.
+
+For a recording that genuinely needs pause cleanup only, the direct apply path remains:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
@@ -107,33 +140,95 @@ If `transcript.edit.json` already exists and you want to reuse the existing edit
 - On the first run it backs up `project.json` to `project.json.bak` and re-applies edits from that backup, so runs are idempotent — re-run with `--cuts-file` to add repeat cuts without stacking them on already-cut slices.
 - If `project.json` was changed externally since the last run (edited **or just re-saved** in Screen Studio), the script protects those changes: a re-run with `--cuts-file` applies the new cuts **incrementally to the current timeline** (external edits preserved, no ASR needed); a full re-run refuses and requires `--discard-external-edits` to intentionally start over from the backup. Do not pass `--discard-external-edits` without telling the user their Screen Studio adjustments will be lost.
 - `process.py` uses Bailian FunAudio ASR by default and saves three artifacts: untouched provider output in `bailian_asr.json`, a **source-time editing transcript** in `transcript.edit.json`, and the compatibility copy `transcript.json`. Editing transcripts preserve standalone fillers, word timestamps, punctuation, and raw ASR sentence boundaries — subtitle cleanup must never run before edit-candidate review. The old local Whisper path is only for explicit comparison or emergency fallback via `--asr-backend local`; do not use it silently. If Bailian fails twice, the script continues with audio-only editing and says so.
-- Pause candidates combine **per-session adaptive energy silence** with local **Silero VAD**. VAD catches non-speech gaps that contain fan noise or keyboard sounds; ASR word protection prevents recognized speech from being cut. Screen activity protection is also on by default: click/keystroke files and a low-resolution display-change scan keep silent tutorial actions. Do not pass `--no-vad`, `--no-visual-scan`, or `--no-screen-activity-protection` unless diagnosing a specific failure.
+- Pause candidates combine **per-session adaptive energy silence** with local **Silero VAD**. VAD catches non-speech gaps that contain fan noise or keyboard sounds; ASR word protection prevents recognized speech from being cut. Screen activity protection is also on by default: click/keystroke files and a low-resolution display-change scan keep silent tutorial actions. Omni-reviewed cuts may clear activity only when the model explicitly marks it redundant and supplies a visual assessment; a claimed `none` never overrides a real input event. Every override is recorded in `reviewed_cuts_activity_clearance_overrides`. Do not pass `--no-vad`, `--no-visual-scan`, or `--no-screen-activity-protection` unless diagnosing a specific failure.
 - The silence threshold defaults to `auto`, estimated separately for every recording session from short-window noise/speech percentiles. Only pass a fixed `--silence-db` when auto misbehaves: lower toward `-35` if speech gets clipped, or raise toward `-20` if pauses remain. `--silence-min-dur` (default 0.3s) is the shortest audio-inactivity region considered.
 - Multi-session recordings (pausing/resuming while recording) are handled: each session's audio runs slightly longer than its slot in the slice timeline, and the script re-anchors ASR and silence timestamps per session. `transcript.json` is saved in **slice-timeline coordinates**, so `start`/`end` values from it can be copied into `cuts.json` as `start_ms`/`end_ms` (×1000) directly.
-- A pause cut never removes anything ASR recognized as a word. Reviewed filler/repeat cuts use nearby low-energy waveform points for their final splice boundaries; do not add fixed inward padding to ASR timestamps.
+- A pause cut never removes anything ASR recognized as a word. Reviewed filler/repeat cuts use nearby low-energy waveform points for their final splice boundaries, but refinement is clamped inside the reviewed range. Structural retake ranges preserve their intentional leading/trailing dead-air up to the clean restart; do not add fixed inward padding to ASR timestamps.
 - New cuts files are schema-v2 objects declaring `coordinate_space` (`source` or `edited`) and a `project_sha256`. `process.py` maps edited/export-time cuts through the exact current `slices` map and refuses mismatched project fingerprints. Legacy list-only cuts are accepted as source time with a warning.
 
 ### 3. Review repeated narration
 
 Read `transcript.edit.json` yourself. Do not ask the user to mark obvious repeats.
 
-Optional Gemini-assisted review:
+Gemini whole-timeline review (default for this creator):
 
-- Use Gemini to review edit candidates, not to edit the `.screenstudio` project directly.
+- Candidate discovery and final deletion are separate. Local audio/ASR code
+  supplies measured pauses, Gemini supplies long-range semantic hypotheses,
+  and the preference arbiter chooses only high-confidence complete ranges.
+- A visual `screen_pause` must be narrowed to a real transcript-grounded
+  silence. A claimed pause that overlaps speech is rejected; an over-wide
+  pause is reduced to its longest safe word gap with 80 ms speech margins.
+- Speech candidates require valid transcript IDs plus verbatim removed and
+  replacement quotes. Model timestamps or reasons that point at different
+  words are rejected locally.
+- Screen-active pauses below six seconds remain untouched. Longer subjective
+  pauses get 35 seconds of transcript context so an earlier “pause/read/show”
+  instruction protects the complete result-showcase sequence.
+- Continuously changing visuals with almost no mouse/keyboard telemetry are
+  protected even if the model votes to cut; this catches animations, result
+  playback, and passive showcases that look like navigation to a text model.
+- `global_edit_planner.py` and `preference_edit_arbiter.py` cache by exact
+  transcript/video/candidate/preference fingerprints. Re-running an unchanged
+  project should not pay for the same model decision twice.
+
+Bailian hybrid review (optional deep comparison/fallback):
+
+- Use `qwen3.5-omni-plus` as the primary short-clip reviewer because it hears the microphone and sees the screen. Do not replace it wholesale with a visual-only reasoning model: historical bakeoffs showed that `qwen3.7-plus`/`qwen3.7-max` can miss a spoken restart whose key evidence is delivery and a long pause.
+- The default `--semantic-audit long-cuts` sends Omni's proposed cuts of 15 seconds or longer, all high-risk structural narration cuts (false starts, isolated takes, abandoned sentences, sparse retakes, and explicit self-corrections), and screen-active pauses of at least 5 seconds to `qwen3.7-plus` for an independent semantic veto. This routing is based on candidate risk rather than vocabulary. The audit can downgrade a cut to manual review but can never create a new cut. `qwen3.7-max-2026-06-08` was slower without improving the held-out result, so it is not the default.
 - Prefer this when the video has filler words, false starts, or repeated takes that silence detection cannot remove.
-- Candidate search scans the complete timeline, including multi-sentence repeats up to 60 seconds apart; it then balances candidates across the recording and reviews them in batches. Do not restore a chronological “first N” cap.
-- If `GEMINI_API_KEY` is available and `--video` is provided, the reviewer sends short clips with audio to the native Gemini API. Otherwise it falls back to ZenMux plus still frames. Model output remains advisory: timeline validation, input/display protection, and waveform boundary refinement run locally.
+- Candidate search scans the complete timeline, including multi-sentence repeats up to 60 seconds apart, abandoned questions, and short spoken islands bounded by long pauses; it then balances candidates across the recording and reviews them in batches. Do not restore a chronological “first N” cap.
+- Any candidate at or above the semantic-audit threshold is isolated in its own Omni request before the independent audit. This prevents a long explanation from being misclassified because several unrelated candidates diluted the request context.
+- If Omni proposes a cut while claiming `screen_action=none` but the activity report proves a click/keystroke occurred, the candidate is automatically re-reviewed alone. The second response must classify the known action as `redundant` or `meaningful`; `none` never clears input telemetry.
+- Never send free-form full-transcript suggestions directly to the timeline.
+  Whole-timeline models may only propose hypotheses; transcript quote
+  grounding, real-silence refinement, creator-preference arbitration, activity
+  protection, and a final `process.py` dry run remain mandatory.
+- Fillers use a cheap conservative gate before any model call. Only a single unambiguous hesitation such as `呃/嗯` with at least 120 ms of transcript gap on **both** sides, a 160–900 ms spoken duration, and no overlapping click/keystroke is cut locally. Connected, clustered, ambiguous, or activity-overlapping fillers are preserved; they are not sent to Omni by default. Use `--review-fillers-with-model` only for diagnostic comparison. Weak discourse words such as `这个/然后/其实/的话` and the sentence particle `啊` remain excluded unless `--include-all-fillers` is explicitly requested, and weak fillers still cannot become automatic cuts.
+- Screen-active pauses shorter than 6 seconds are also preserved locally by default (`--protected-pause-min-review-ms 6000`). A five-project hand-edit benchmark showed that these subjective action pauses caused most false positives; the 6-second conservative gate raised aggregate time precision from about 93% to 98%. Longer protected pauses still receive Omni review and the independent semantic audit. Ordinary short silence without screen activity is unaffected and remains eligible for the deterministic pause editor.
+- Pass the first `process.py` dry-run report through `--activity-report`. Only pauses that were protected because of screen/input activity are added for expensive multimodal review; pauses already handled safely stay local.
+- The reviewer loads the existing Bailian key from `DASHSCOPE_API_KEY` or `~/.bailian/config.json`. With `--video`, it sends compressed short clips to Qwen Omni so the model can hear speech and inspect screen actions together. A separate Screen Studio microphone track can be supplied with `--audio`; the reviewer muxes it into each evidence clip. `qwen3.7-plus` samples long screen clips at 0.5 fps by default to keep the veto fast; it relies on the supplied transcript for speech semantics. Model output remains advisory: timeline validation, deterministic filler/structure gates, activity protection, and waveform boundary refinement run locally. A structurally strong isolated take that receives only medium/low confidence is automatically arbitrated once in its own request; only a high-confidence tie-break is accepted.
 
-For a source-time editing transcript, review without an exported video (or pass a source-time proxy video if one exists):
+For a single-session source-time project, pass the original display and microphone tracks so timestamps remain in source time:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/gemini_edit_candidates.py" \
   --transcript "/path/to/Project.screenstudio/transcript.edit.json" \
+  --video "/path/to/Project.screenstudio/recording/channel-2-display-0.mp4" \
+  --audio "/path/to/Project.screenstudio/recording/channel-3-microphone-0.m3u8" \
+  --activity-report "/tmp/screenstudio-autoedit-report.json" \
   --coordinate-space source \
   --project-json "/path/to/Project.screenstudio/project.json" \
-  --output "/tmp/gemini_edit_report.json" \
-  --cuts-output "/tmp/gemini_cuts.json"
+  --review-backend bailian \
+  --output "/tmp/omni_edit_report.json" \
+  --cuts-output "/tmp/omni_cuts.json"
 ```
+
+For a **multi-session source-time project**, first build one aligned review
+proxy. The builder trims or pads every display/microphone segment to its
+metadata duration before concatenation, so the evidence timeline exactly
+matches `project.json` even when the encoded source files drift:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/build_review_proxy.py" \
+  "/path/to/Project.screenstudio"
+
+"$PYTHON" "$SKILL_DIR/scripts/gemini_edit_candidates.py" \
+  --transcript "/path/to/Project.screenstudio/transcript.edit.json" \
+  --video "/path/to/Project.screenstudio/review-proxy/display-timeline.mp4" \
+  --audio "/path/to/Project.screenstudio/review-proxy/microphone-timeline.wav" \
+  --activity-report "/tmp/screenstudio-autoedit-report.json" \
+  --coordinate-space source \
+  --project-json "/path/to/Project.screenstudio/project.json" \
+  --review-backend bailian \
+  --output "/tmp/omni_edit_report.json" \
+  --cuts-output "/tmp/omni_cuts.json"
+```
+
+If a paid review is interrupted after some batches finish, rerun the identical
+command with `--resume` and the same `--work-dir`. Only complete cached
+responses whose candidate IDs exactly match the rebuilt batch are reused.
+Quota-exhaustion errors stop queued calls immediately instead of repeatedly
+retrying or starting the rest of the batch queue.
 
 For an **exported edited video**, transcribe that export in raw editing mode and explicitly mark the result as edited time. Never label exported timestamps as source time:
 
@@ -151,23 +246,46 @@ For an **exported edited video**, transcribe that export in raw editing mode and
   --video "/path/to/exported_edited.mp4" \
   --coordinate-space edited \
   --project-json "/path/to/Project.screenstudio/project.json" \
-  --output "/tmp/gemini_edit_report.json" \
-  --cuts-output "/tmp/gemini_cuts.json"
+  --review-backend bailian \
+  --output "/tmp/omni_edit_report.json" \
+  --cuts-output "/tmp/omni_cuts.json"
 ```
 
-Apply high-confidence Gemini cuts through the existing timeline editor:
+Apply high-confidence Omni cuts through the existing timeline editor:
+
+First repeat the dry run with the reviewed cuts and inspect the new audit. This catches model/activity/boundary interactions before any project write:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/process.py" \
+  --project "/path/to/Project.screenstudio" \
+  --skip-transcribe "/tmp/screenstudio-autoedit-report.transcript.edit.json" \
+  --cuts-file "/tmp/omni_cuts.json" \
+  --pause-threshold 800 \
+  --min-pause 300 \
+  --pause-source silence \
+  --asr-backend bailian \
+  --language zh \
+  --dry-run \
+  --report-output "/tmp/screenstudio-autoedit-final-report.json"
+```
+
+Then apply the exact same transcript/cuts without `--dry-run`:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
   --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
-  --cuts-file "/tmp/gemini_cuts.json" \
+  --cuts-file "/tmp/omni_cuts.json" \
   --pause-threshold 800 \
   --min-pause 300 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh
 ```
+
+If only deterministic safety or boundary rules changed after a paid review, use `--reuse-review-report /tmp/omni_edit_report.json` to rebuild the cuts without calling the model again. `--review-types` and `--range-start/--range-end` are for targeted calibration; do not use a targeted report as if it were a complete full-timeline review.
+
+For model upgrades, use `scripts/model_bakeoff.py` with a labeled manifest whose expected values are kept out of prompts. Compare exact automatic decisions, unsafe false cuts, and mean latency before changing defaults. Never promote a model from anecdotal inspection alone.
 
 Cut only high-confidence issues:
 

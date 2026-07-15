@@ -30,6 +30,7 @@ from editing_core import (
     load_cuts_document,
     merge_intervals,
     protect_cuts_with_activity,
+    protect_reviewed_cuts_with_activity,
 )
 
 
@@ -512,20 +513,50 @@ def refine_repeat_cut_boundaries(
                 float(ordered_words[last + 1]["start"]) * 1000.0 - speech_guard_ms
                 if last + 1 < len(ordered_words) else last_end + search_ms
             )
-            start_window = (
-                max(0.0, previous_end, first_start - search_ms),
-                max(0.0, first_start - speech_guard_ms),
+            gap_preserving_type = cut.get("candidate_type") in {
+                "possible_abandoned_sentence", "possible_isolated_take",
+            }
+            spoken_start_ms = cut.get("spoken_start_ms")
+            preserves_leading_gap = (
+                gap_preserving_type
+                and spoken_start_ms is not None
+                and float(spoken_start_ms) - start_ms > search_ms
             )
-            end_window = (
-                last_end + speech_guard_ms,
-                min(next_start, last_end + search_ms),
-            )
+            if preserves_leading_gap:
+                start_window = (
+                    start_ms,
+                    min(end_ms, start_ms + search_ms),
+                )
+            else:
+                start_window = (
+                    max(0.0, start_ms, previous_end, first_start - search_ms),
+                    min(end_ms, max(0.0, first_start - speech_guard_ms)),
+                )
+            if gap_preserving_type:
+                # The reviewed range intentionally includes the dead gap up to
+                # the clean restart. Refining from the last abandoned word
+                # would put that gap back into the video. Search immediately
+                # before the reviewed restart boundary instead.
+                end_window = (
+                    max(start_ms, end_ms - search_ms),
+                    max(start_ms, end_ms - speech_guard_ms),
+                )
+            else:
+                end_window = (
+                    max(start_ms, last_end + speech_guard_ms),
+                    min(end_ms, next_start, last_end + search_ms),
+                )
         else:
-            start_window = (max(0.0, start_ms - search_ms), start_ms + search_ms)
-            end_window = (max(start_ms, end_ms - search_ms), end_ms + search_ms)
+            start_window = (start_ms, min(end_ms, start_ms + search_ms))
+            end_window = (max(start_ms, end_ms - search_ms), end_ms)
 
         new_start = quiet.quietest_timeline_ms(*start_window, session_offsets) or start_ms
         new_end = quiet.quietest_timeline_ms(*end_window, session_offsets) or end_ms
+        # Model/ASR ranges are the semantic authorization boundary. Waveform
+        # refinement may move a splice *inside* that range, never expand it
+        # into neighbouring speech or screen actions.
+        new_start = min(end_ms, max(start_ms, new_start))
+        new_end = min(end_ms, max(start_ms, new_end))
         if new_end - new_start < 120.0:
             log(f"⚠️  Unsafe refined cut skipped: {start_ms/1000:.2f}s→{end_ms/1000:.2f}s")
             continue
@@ -1410,20 +1441,31 @@ def run_incremental_repeat_cuts(
         log(f"⚠️  Incremental boundary refinement unavailable: {exc}")
 
     if protect_screen_activity and session_offsets:
-        activity_intervals = load_input_activity_intervals(project_dir, metadata, session_offsets)
+        input_activity_intervals = load_input_activity_intervals(
+            project_dir, metadata, session_offsets
+        )
+        visual_activity_intervals: list[tuple[float, float]] = []
         if visual_scan:
-            activity_intervals.extend(detect_visual_activity_intervals(
+            visual_activity_intervals = detect_visual_activity_intervals(
                 project_dir,
                 metadata,
                 session_offsets,
                 fps=visual_scan_fps,
                 scene_threshold=visual_change_threshold,
-            ))
-        activity_intervals = merge_intervals(activity_intervals, gap_ms=120.0)
+            )
         if not allow_active_repeat_cuts:
-            repeats, protected = protect_cuts_with_activity(repeats, activity_intervals)
+            repeats, protected, overrides = protect_reviewed_cuts_with_activity(
+                repeats,
+                merge_intervals(input_activity_intervals, gap_ms=120.0),
+                merge_intervals(visual_activity_intervals, gap_ms=120.0),
+            )
             if protected:
                 log(f"🛡️  Kept {len(protected)} incremental cut(s) containing screen activity.")
+            if overrides:
+                log(
+                    f"👁️  Applied {len(overrides)} reviewed cut(s) across detected "
+                    "activity explicitly cleared by the multimodal reviewer."
+                )
         if not repeats:
             log("❌ Every reviewed cut overlaps protected screen activity — nothing applied.")
             sys.exit(1)
@@ -1745,28 +1787,50 @@ def main():
         # A silent microphone is not a blank tutorial. Protect click/keystroke
         # events and meaningful display changes before any automatic cut lands.
         activity_intervals: list[tuple[float, float]] = []
+        input_activity_intervals: list[tuple[float, float]] = []
+        visual_activity_intervals: list[tuple[float, float]] = []
         protected_pauses: list[dict] = []
         protected_repeats: list[dict] = []
+        visual_clearance_overrides: list[dict] = []
         if not args.no_screen_activity_protection and (pauses or repeats):
-            activity_intervals.extend(
-                load_input_activity_intervals(project_dir, metadata, session_offsets)
+            input_activity_intervals = load_input_activity_intervals(
+                project_dir, metadata, session_offsets
             )
             if not args.no_visual_scan:
-                activity_intervals.extend(detect_visual_activity_intervals(
+                visual_activity_intervals = detect_visual_activity_intervals(
                     project_dir,
                     metadata,
                     session_offsets,
                     fps=args.visual_scan_fps,
                     scene_threshold=args.visual_change_threshold,
-                ))
-            activity_intervals = merge_intervals(activity_intervals, gap_ms=120.0)
+                )
+            input_activity_intervals = merge_intervals(
+                input_activity_intervals, gap_ms=120.0
+            )
+            visual_activity_intervals = merge_intervals(
+                visual_activity_intervals, gap_ms=120.0
+            )
+            activity_intervals = merge_intervals(
+                input_activity_intervals + visual_activity_intervals, gap_ms=120.0
+            )
             pauses, protected_pauses = protect_cuts_with_activity(pauses, activity_intervals)
             if protected_pauses:
                 log(f"🛡️  Kept {len(protected_pauses)} silent interval(s) containing screen activity.")
             if not args.allow_active_repeat_cuts:
-                repeats, protected_repeats = protect_cuts_with_activity(repeats, activity_intervals)
+                repeats, protected_repeats, visual_clearance_overrides = (
+                    protect_reviewed_cuts_with_activity(
+                        repeats,
+                        input_activity_intervals,
+                        visual_activity_intervals,
+                    )
+                )
                 if protected_repeats:
                     log(f"🛡️  Kept {len(protected_repeats)} reviewed cut(s) containing screen activity.")
+                if visual_clearance_overrides:
+                    log(
+                        f"👁️  Applied {len(visual_clearance_overrides)} reviewed cut(s) "
+                        "across detected activity explicitly cleared by the multimodal reviewer."
+                    )
 
         all_cuts = pauses + repeats
         log_long_cuts(all_cuts)
@@ -1838,6 +1902,9 @@ def main():
             "reviewed_cuts_applied": repeats,
             "pauses_protected_by_activity": protected_pauses,
             "reviewed_cuts_protected_by_activity": protected_repeats,
+            "reviewed_cuts_activity_clearance_overrides": visual_clearance_overrides,
+            "input_activity_intervals_ms": input_activity_intervals,
+            "visual_activity_intervals_ms": visual_activity_intervals,
             "activity_intervals_ms": activity_intervals,
             "wordless_slices_removed": removed_wordless_slices,
             "original_duration_ms": original_duration,
