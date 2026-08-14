@@ -29,7 +29,8 @@ from gemini_edit_candidates import (
 
 
 DEFAULT_MODEL = "google/gemini-3.5-flash"
-PLANNER_VERSION = 4
+PLANNER_VERSION = 11
+LEADING_SILENCE_RETAINED_FOR_LOCAL_CLEANUP_S = 0.22
 END_PUNCTUATION = re.compile(r"[。！？!?；;]$")
 SOFT_PUNCTUATION = re.compile(r"[，,：:]$")
 VALID_CATEGORIES = {
@@ -37,9 +38,11 @@ VALID_CATEGORIES = {
     "explicit_restart",
     "duplicate_take",
     "self_correction",
+    "delivery_cleanup",
     "recording_meta",
     "failed_demo_narration",
     "screen_pause",
+    "content_compression",
 }
 
 
@@ -54,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument(
+        "--preferences",
+        type=Path,
+        help="Optional creator preference file with hand-edited cut examples.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--video",
@@ -66,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--editorial-only",
+        action="store_true",
+        help="Run a focused creator-style content-compression discovery pass.",
+    )
     parser.add_argument(
         "--max-candidate-ms",
         type=float,
@@ -121,7 +134,9 @@ def transcript_atoms(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
             token = _word_text(word)
             hard_boundary = bool(END_PUNCTUATION.search(token))
             soft_boundary = bool(SOFT_PUNCTUATION.search(token)) and (
-                len(text) >= 10 or end - start >= 2.5
+                len(text) >= 10
+                or end - start >= 2.5
+                or (len(text) <= 5 and end - start <= 1.0)
             )
             gap_boundary = next_start is not None and next_start - end >= 0.55
             duration_boundary = end - start >= 10.0
@@ -150,7 +165,12 @@ def timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{whole_seconds:02d}.{millis:03d}"
 
 
-def build_prompt(atoms: list[dict[str, Any]], *, video_supplied: bool = False) -> str:
+def build_prompt(
+    atoms: list[dict[str, Any]],
+    *,
+    video_supplied: bool = False,
+    creator_cut_examples: list[dict[str, Any]] | None = None,
+) -> str:
     rows = "\n".join(
         f"[{item['id']} {timestamp(item['start'])}-{timestamp(item['end'])}] {item['text']}"
         for item in atoms
@@ -168,7 +188,7 @@ def build_prompt(atoms: list[dict[str, Any]], *, video_supplied: bool = False) -
                 "replacement_quote": "verbatim words copied from replacement IDs",
                 "category": (
                     "abandoned_take | explicit_restart | duplicate_take | "
-                    "self_correction | recording_meta | failed_demo_narration | "
+                    "self_correction | delivery_cleanup | recording_meta | failed_demo_narration | "
                     "screen_pause"
                 ),
                 "confidence": "high | medium | low",
@@ -193,11 +213,32 @@ Include:
 - an earlier duplicate take whose intended information is fully present in a
   later cleaner take;
 - a local self-correction where the first wording is clearly superseded;
+- a short dangling connector, repeated syllable, hesitation, or delivery
+  fragment whose removal makes the surrounding spoken sentence more fluent
+  without losing a claim. Listen to the audio instead of relying only on ASR
+  punctuation;
+- a very short standalone transition acknowledgement at the edge of a long
+  pause when it carries no claim and the video/audio make a clean direct splice;
 - narration belonging only to a failed screen demo before the demo restarts.
 {"- silent waiting/setup/navigation where the final state remains visible and watching the intermediate action teaches nothing;\n- trailing dead air after the final useful sentence." if video_supplied else ""}
 
+Failed-take grouping:
+- Treat one failed narration/demo attempt as a sequence, not as isolated words.
+  When its apparently useful screen action or result is shown again in the clean
+  replacement take, propose the complete disposable attempt from its earliest
+  unique utterance through the transition before the clean restart.
+- If the safe boundary is genuinely ambiguous, return both a tight speech-only
+  candidate and a broader complete-attempt alternative. This is a high-recall
+  discovery pass; the later personalized full-video arbiter will choose which
+  complete range, if any, is safe.
+- Do not omit a broader failed-take alternative merely because an interior
+  click, preview, or generated result looks useful in isolation. It is redundant
+  when the later retained take clearly recreates the same viewer-facing value.
+
 Do NOT include:
-- ordinary fillers such as 呃/嗯 by themselves;
+- a fluent discourse marker merely because it is short. A filler such as 呃/嗯
+  is eligible only when it is acoustically isolated and removing it produces a
+  clean splice;
 - fluent explanations merely because they are wordy;
 - a repeated passage that adds a claim, example, number, warning, result, or
   troubleshooting detail;
@@ -225,7 +266,9 @@ Boundaries:
 - cut_until_id is the first utterance that must remain after the cut. Use it
   when dead air between the failed take and clean restart should also vanish.
 - replacement_ids identify the later clean take or correction that preserves
-  the meaning. Use an empty list only for explicit recording meta-talk.
+  the meaning. For a high-confidence short local self_correction or
+  delivery_cleanup, replacement_ids may be empty only when cut_until_id is the
+  immediately following utterance and the remaining sentence is complete.
 - removed_quote and replacement_quote must be short VERBATIM substrings copied
   from the corresponding transcript rows. They are mandatory grounding checks,
   not paraphrases. For screen_pause, leave both quotes empty.
@@ -234,6 +277,62 @@ Boundaries:
   genuinely ambiguous.
 
 Return strict JSON only in this shape:
+{json.dumps(schema, ensure_ascii=False, indent=2)}
+
+FULL TRANSCRIPT:
+{rows}
+""".strip()
+
+
+def build_editorial_prompt(
+    atoms: list[dict[str, Any]],
+    *,
+    video_supplied: bool = False,
+    creator_cut_examples: list[dict[str, Any]] | None = None,
+) -> str:
+    rows = "\n".join(
+        f"[{item['id']} {timestamp(item['start'])}-{timestamp(item['end'])}] {item['text']}"
+        for item in atoms
+    )
+    schema = {
+        "edits": [{
+            "remove_start_id": "U0001",
+            "remove_end_id": "U0002",
+            "cut_until_id": "U0003",
+            "replacement_ids": [],
+            "removed_quote": "verbatim words copied from the removed IDs",
+            "replacement_quote": "",
+            "category": "content_compression",
+            "confidence": "high | medium | low",
+            "reason": "why this creator would remove the complete passage",
+        }]
+    }
+    return f"""
+You have exactly ONE job: propose EDITORIAL COMPRESSION candidates for this
+creator's Mandarin screen tutorial. Do not search for stutters, false starts,
+silent pauses, or recording mistakes; another pass already handles them.
+
+Find 5-20 fluent but optional passages that resemble what this creator removed
+in other hand-edited videos: redundant summaries, repeated implications,
+personal asides, tangents, overlong setup, or detail beyond the core point.
+This is candidate discovery only. A second full-video model and safety gates
+will reject unsafe ideas, so favor recall while keeping every range concrete.
+
+Each candidate must:
+- be a contiguous 2.5-45 second range;
+- use remove_start_id/remove_end_id from the transcript and set cut_until_id to
+  the immediately following retained utterance;
+- use category content_compression and leave replacement_ids empty;
+- include a short verbatim removed_quote;
+- preserve all indispensable claims, examples, numbers, warnings, results,
+  instructions, and viewer-facing screen actions outside the proposed range.
+
+{("A complete aligned video is attached. Use its audio and screen when judging optionality." if video_supplied else "Use transcript structure and creator examples.")}
+
+HAND-EDITED CUT EXAMPLES FROM OTHER VIDEOS:
+{json.dumps(creator_cut_examples or [], ensure_ascii=False)}
+
+Return strict JSON only:
 {json.dumps(schema, ensure_ascii=False, indent=2)}
 
 FULL TRANSCRIPT:
@@ -273,6 +372,8 @@ def planner_signature(
     model: str,
     atoms: list[dict[str, Any]],
     video: Path | None = None,
+    preference_signature: str | None = None,
+    editorial_only: bool = False,
 ) -> str:
     payload = {
         "planner_version": PLANNER_VERSION,
@@ -282,6 +383,8 @@ def planner_signature(
             for item in atoms
         ],
         "video_sha256": file_sha256(video) if video else None,
+        "preference_signature": preference_signature,
+        "editorial_only": editorial_only,
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -390,17 +493,6 @@ def candidates_from_plan(
                     end = proposed_end
             removed_atoms = atoms[positions[start_id] : positions[end_id] + 1]
             key = (start_id, end_id, cut_until_id)
-        duration_ms = (end - start) * 1000.0
-        minimum_duration_ms = 800.0 if timed_pause else 600.0
-        if (
-            duration_ms < minimum_duration_ms
-            or duration_ms > max_candidate_ms
-            or start < 0.0
-            or end > timeline_end + 10.0
-        ):
-            rejected.append({"proposal": raw, "reason": "unsafe_duration"})
-            continue
-
         replacement_ids = [
             str(item)
             for item in (raw.get("replacement_ids") or [])
@@ -414,7 +506,120 @@ def candidates_from_plan(
                 )
             )
         ]
-        if category not in {"recording_meta", "screen_pause"} and not replacement_ids:
+        planner_range_narrowed_to_tail = False
+        short_transition_cleanup = False
+        semantic_spoken_start = start
+        removed_quote_value = str(raw.get("removed_quote") or "").strip()
+        if (
+            not timed_pause
+            and category == "delivery_cleanup"
+            and confidence == "high"
+            and not replacement_ids
+            and cut_until_id in by_id
+            and positions[cut_until_id] == positions[end_id] + 1
+            and len(removed_atoms) > 1
+        ):
+            tail_atom = removed_atoms[-1]
+            preceding_text = "".join(
+                str(item.get("text") or "") for item in removed_atoms[:-1]
+            ).strip()
+            tail_text = str(tail_atom.get("text") or "").strip()
+            tail_start = float(tail_atom["start"])
+            tail_spoken_end = float(tail_atom["end"])
+            tail_end = float(by_id[cut_until_id]["start"])
+            if (
+                len(grounding_text(tail_text)) <= 10
+                and len(grounding_text(preceding_text)) >= 8
+                and bool((END_PUNCTUATION.search(preceding_text) or SOFT_PUNCTUATION.search(preceding_text)))
+                and not END_PUNCTUATION.search(tail_text)
+                and tail_spoken_end - tail_start <= 1.5
+                and tail_end - tail_start <= 2.5
+            ):
+                # A model may correctly identify a dangling tail but include the
+                # useful clause before it. Preserve that clause and keep only
+                # the tightly bounded tail as a review candidate.
+                original_start_id = start_id
+                start_id = end_id
+                start = tail_start
+                semantic_spoken_start = tail_start
+                spoken_end = tail_spoken_end
+                end = tail_end
+                removed_atoms = [tail_atom]
+                key = (start_id, end_id, cut_until_id)
+                removed_quote_value = tail_text
+                planner_range_narrowed_to_tail = True
+
+        if (
+            not timed_pause
+            and category == "delivery_cleanup"
+            and confidence == "high"
+            and not replacement_ids
+            and cut_until_id in by_id
+            and positions[cut_until_id] == positions[end_id] + 1
+            and len(removed_atoms) == 1
+        ):
+            atom = removed_atoms[0]
+            position = positions[str(atom["id"])]
+            atom_text = str(atom.get("text") or "").strip()
+            atom_start = float(atom["start"])
+            atom_end = float(atom["end"])
+            previous_end = (
+                float(atoms[position - 1]["end"]) if position > 0 else 0.0
+            )
+            leading_gap = atom_start - previous_end
+            if (
+                position > 0
+                and len(grounding_text(atom_text)) <= 4
+                and atom_end - atom_start <= 1.0
+                and leading_gap >= 0.5
+            ):
+                # The model has semantically authorized a tiny transition word.
+                # Include the adjacent leading dead air while retaining the same
+                # pacing cushion used by ordinary pause edits.
+                semantic_spoken_start = atom_start
+                start = min(
+                    atom_start,
+                    previous_end + LEADING_SILENCE_RETAINED_FOR_LOCAL_CLEANUP_S,
+                )
+                short_transition_cleanup = True
+
+        duration_ms = (end - start) * 1000.0
+        minimum_duration_ms = 800.0 if timed_pause else 600.0
+        if (
+            duration_ms < minimum_duration_ms
+            or duration_ms > max_candidate_ms
+            or start < 0.0
+            or end > timeline_end + 10.0
+        ):
+            rejected.append({"proposal": raw, "reason": "unsafe_duration"})
+            continue
+
+        replacementless_local_cleanup = (
+            category in {"self_correction", "delivery_cleanup"}
+            and confidence == "high"
+            and cut_until_id in by_id
+            and positions[cut_until_id] == positions[end_id] + 1
+            and duration_ms <= 2_500.0
+            and len(removed_atoms) == 1
+            and (
+                short_transition_cleanup
+                or not END_PUNCTUATION.search(
+                    str(removed_atoms[0].get("text") or "")
+                )
+            )
+        )
+        replacementless_content_compression = (
+            category == "content_compression"
+            and cut_until_id in by_id
+            and positions[cut_until_id] == positions[end_id] + 1
+            and 2_500.0 <= duration_ms <= 45_000.0
+        )
+        if (
+            category not in {"recording_meta", "screen_pause"}
+            and not replacement_ids
+            and not replacementless_local_cleanup
+            and not replacementless_content_compression
+        ):
             rejected.append({"proposal": raw, "reason": "missing_external_replacement"})
             continue
 
@@ -428,11 +633,15 @@ def candidates_from_plan(
             else "".join(item["text"] for item in removed_atoms)
         )
         if not timed_pause:
-            removed_quote = grounding_text(str(raw.get("removed_quote") or ""))
+            removed_quote = grounding_text(removed_quote_value)
             replacement_quote = grounding_text(
                 str(raw.get("replacement_quote") or "")
             )
-            if len(removed_quote) < 2 or removed_quote not in grounding_text(removed_text):
+            minimum_quote_length = 1 if short_transition_cleanup else 2
+            if (
+                len(removed_quote) < minimum_quote_length
+                or removed_quote not in grounding_text(removed_text)
+            ):
                 rejected.append({"proposal": raw, "reason": "removed_quote_mismatch"})
                 continue
             if replacement_ids and (
@@ -451,18 +660,29 @@ def candidates_from_plan(
             "start_ms": round(start * 1000.0),
             "end_ms": round(end * 1000.0),
             "duration_ms": round(duration_ms),
-            "spoken_start": start,
+            "spoken_start": semantic_spoken_start,
             "spoken_end": spoken_end,
+            "spoken_start_ms": round(semantic_spoken_start * 1000.0),
+            "spoken_end_ms": round(spoken_end * 1000.0),
             "removed_text": removed_text,
             "kept_text": replacement_text,
             "planner_category": category,
             "planner_confidence": confidence,
             "planner_reason": str(raw.get("reason") or "").strip(),
-            "removed_quote": str(raw.get("removed_quote") or "").strip(),
+            "removed_quote": removed_quote_value,
             "replacement_quote": str(raw.get("replacement_quote") or "").strip(),
             "replacement_ids": replacement_ids,
+            "cut_until_id": cut_until_id or None,
+            "replacementless_local_cleanup": replacementless_local_cleanup,
+            "replacementless_content_compression": (
+                replacementless_content_compression
+            ),
+            "planner_range_narrowed_to_tail": planner_range_narrowed_to_tail,
+            "short_transition_cleanup": short_transition_cleanup,
             "planner_model": model,
         }
+        if planner_range_narrowed_to_tail:
+            candidate["planner_original_start_id"] = original_start_id
         if replacement_ids:
             candidate["kept_start"] = float(by_id[replacement_ids[0]]["start"])
             candidate["kept_end"] = float(by_id[replacement_ids[-1]]["end"])
@@ -481,8 +701,34 @@ def main() -> None:
             fail(f"Video does not exist: {args.video}")
         if args.video.stat().st_size > 80 * 1024 * 1024:
             fail("Inline ZenMux video is limited to 80MB in this workflow.")
-    prompt = build_prompt(atoms, video_supplied=bool(args.video))
-    signature = planner_signature(args.model, atoms, args.video)
+    preferences: dict[str, Any] = {}
+    if args.preferences:
+        if not args.preferences.exists():
+            fail(f"Creator preferences do not exist: {args.preferences}")
+        preferences = json.loads(args.preferences.read_text(encoding="utf-8"))
+    creator_cut_examples = [
+        item
+        for item in (preferences.get("manual_cut_examples") or [])
+        if args.editorial_only and isinstance(item, dict)
+    ]
+    prompt_builder = build_editorial_prompt if args.editorial_only else build_prompt
+    prompt = prompt_builder(
+        atoms,
+        video_supplied=bool(args.video),
+        creator_cut_examples=creator_cut_examples,
+    )
+    preference_signature = (
+        str(preferences.get("signature") or "") or None
+        if args.editorial_only
+        else None
+    )
+    signature = planner_signature(
+        args.model,
+        atoms,
+        args.video,
+        preference_signature,
+        args.editorial_only,
+    )
     args.work_dir.mkdir(parents=True, exist_ok=True)
     request_path = args.work_dir / "global_planner_request.redacted.json"
     response_path = args.work_dir / "global_planner_response.raw.json"
@@ -503,6 +749,9 @@ def main() -> None:
         ]
     request_payload = {
         "model": args.model,
+        "preferences": str(args.preferences) if args.preferences else None,
+        "preference_signature": preference_signature,
+        "editorial_only": args.editorial_only,
         "messages": [
             {
                 "role": "system",
@@ -563,6 +812,7 @@ def main() -> None:
     )
     report = {
         "schema_version": 1,
+        "planner_version": PLANNER_VERSION,
         "transcript": str(args.transcript),
         "video": str(args.video) if args.video else None,
         "model": args.model,

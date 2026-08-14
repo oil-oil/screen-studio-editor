@@ -23,10 +23,43 @@ from typing import Any
 
 
 FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-SKILL_DIR = Path(__file__).resolve().parents[1]
-HOTWORDS_PATH = SKILL_DIR / "hotwords.json"
-GLOSSARY_PATH = SKILL_DIR / "glossary.json"
-VOCABULARY_CACHE_PATH = SKILL_DIR / ".vocabulary-cache.json"
+
+
+def _load_user_config() -> dict[str, Any]:
+    config_path = Path(
+        os.environ.get(
+            "SCREEN_STUDIO_EDITOR_CONFIG",
+            str(Path.home() / ".config" / "screen-studio-editor" / "config.json"),
+        )
+    ).expanduser()
+    if not config_path.exists():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Invalid Screen Studio Editor config: {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Screen Studio Editor config must be a JSON object: {config_path}")
+    return payload
+
+
+def _optional_user_path(config: dict[str, Any], key: str, env_key: str) -> Path | None:
+    value = str(os.environ.get(env_key) or config.get(key) or "").strip()
+    return Path(value).expanduser() if value else None
+
+
+USER_CONFIG = _load_user_config()
+HOTWORDS_PATH = _optional_user_path(
+    USER_CONFIG, "hotwords", "SCREEN_STUDIO_EDITOR_HOTWORDS"
+)
+GLOSSARY_PATH = _optional_user_path(
+    USER_CONFIG, "glossary", "SCREEN_STUDIO_EDITOR_GLOSSARY"
+)
+VOCABULARY_CACHE_PATH = _optional_user_path(
+    USER_CONFIG, "vocabulary_cache", "SCREEN_STUDIO_EDITOR_VOCABULARY_CACHE"
+) or Path(
+    os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+).expanduser() / "screen-studio-editor" / "vocabulary-cache.json"
 VOCABULARY_TARGET_MODEL = "fun-asr"
 VOCABULARY_PREFIX = "ssedit"
 MAX_SUBTITLE_CHARS = 24
@@ -74,21 +107,21 @@ def _load_dashscope_api_key() -> str | None:
 
 def ensure_hotword_vocabulary() -> str | None:
     """
-    Create or reuse a Bailian hot-word vocabulary built from hotwords.json.
+    Create or reuse a Bailian hot-word vocabulary from the configured file.
 
     Hot words steer ASR toward the channel's recurring proper nouns (Claude,
     Anthropic, 飞书…) at recognition time — errors that glossary text
     replacement can only partially patch afterwards. The vocabulary ID is
-    cached next to the skill keyed by a hash of the hot-word list, so the
-    remote vocabulary is only created/updated when hotwords.json changes.
+    cached outside the skill repository keyed by a hash of the hot-word list,
+    so the remote vocabulary is only created/updated when the list changes.
     Any failure degrades to plain recognition — never block transcription.
     """
-    if not HOTWORDS_PATH.exists():
+    if HOTWORDS_PATH is None or not HOTWORDS_PATH.exists():
         return None
     try:
         hotwords = json.loads(HOTWORDS_PATH.read_text(encoding="utf-8"))
     except Exception as exc:
-        log(f"WARNING: could not read hotwords.json ({exc}); continuing without hot words.")
+        log(f"WARNING: could not read hot words ({exc}); continuing without them.")
         return None
     if not isinstance(hotwords, list) or not hotwords:
         return None
@@ -128,6 +161,7 @@ def ensure_hotword_vocabulary() -> str | None:
                 prefix=VOCABULARY_PREFIX,
                 vocabulary=hotwords,
             )
+        VOCABULARY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         VOCABULARY_CACHE_PATH.write_text(
             json.dumps({"hash": digest, "vocabulary_id": vocabulary_id}),
             encoding="utf-8",
@@ -151,8 +185,8 @@ def _glossary_pattern(wrong: str) -> re.Pattern:
 
 
 def _load_glossary_replacements() -> list[tuple[re.Pattern, str]]:
-    """Load glossary.json as case-insensitive replacement patterns."""
-    if not GLOSSARY_PATH.exists():
+    """Load configured glossary as case-insensitive replacement patterns."""
+    if GLOSSARY_PATH is None or not GLOSSARY_PATH.exists():
         return []
     try:
         entries = json.loads(GLOSSARY_PATH.read_text(encoding="utf-8"))
@@ -517,7 +551,7 @@ _SPLIT_SYSTEM_PROMPT = """你是字幕断句助手。用户给你一句视频口
 1. 只允许插入换行符来断行，绝对不许增加、删除、修改、调换任何字符（包括标点）。
 2. 用尽量少的行数完成切分，每行不超过 24 个汉字宽度（中文字符算 1，英文字母、数字算半个）。
 3. 在自然的语气停顿处断开，每行是语义完整的短语，相邻行长度尽量均衡。
-4. 不要把英文产品名、版本号（如 Claude Fable 5、GPT 5.5、Opus 4.8）拆到两行。
+4. 不要把英文产品名、版本号（如 Claude Code、GPT 5.5、Gemini 3.5 Flash）拆到两行。
 5. 行首不要是「的、了、着、吗、呢、吧、啊」这类粘在前一个短语上的虚词。
 6. 定语和它修饰的中心语放在同一行；「XX的」和后面的名词不要拆开。
 7. 直接输出断好行的文字，不要任何解释、编号或多余内容。"""
@@ -893,11 +927,17 @@ def main():
     parser.add_argument("--keep-fillers", action="store_true",
                         help="Keep standalone filler words such as 呃/嗯/啊 in the transcript.")
     parser.add_argument("--no-hotwords", action="store_true",
-                        help="Disable the hot-word vocabulary built from hotwords.json.")
+                        help="Disable the configured hot-word vocabulary.")
+    parser.add_argument("--hotwords", default=None,
+                        help="Hot-word JSON path; overrides environment and user config.")
     parser.add_argument("--vocabulary-id", default=None,
                         help="Use a specific Bailian hot-word vocabulary ID instead of the managed one.")
+    parser.add_argument("--vocabulary-cache", default=None,
+                        help="Managed vocabulary cache path; overrides environment and user config.")
     parser.add_argument("--no-glossary", action="store_true",
-                        help="Do not apply glossary.json corrections to the transcript text.")
+                        help="Do not apply configured glossary corrections to the transcript text.")
+    parser.add_argument("--glossary", default=None,
+                        help="Glossary JSON path; overrides environment and user config.")
     parser.add_argument("--split-mode", choices=["llm", "rules", "raw"], default="llm",
                         help="Subtitle line splitting: 'llm' (default, phrase-aware via Qwen with "
                              "rule fallback), 'rules' (token scoring only), or 'raw' "
@@ -905,6 +945,14 @@ def main():
     parser.add_argument("--split-model", default=SPLIT_LLM_MODEL,
                         help=f"Chat model for LLM splitting (default: {SPLIT_LLM_MODEL}).")
     args = parser.parse_args()
+
+    global HOTWORDS_PATH, GLOSSARY_PATH, VOCABULARY_CACHE_PATH
+    if args.hotwords:
+        HOTWORDS_PATH = Path(args.hotwords).expanduser()
+    if args.glossary:
+        GLOSSARY_PATH = Path(args.glossary).expanduser()
+    if args.vocabulary_cache:
+        VOCABULARY_CACHE_PATH = Path(args.vocabulary_cache).expanduser()
 
     language = None if args.language == "None" else args.language
     try:

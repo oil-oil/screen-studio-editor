@@ -104,9 +104,10 @@ def build_video_proxy(
             f"[{index}:v:0]trim=duration={duration:.6f},setpts=PTS-STARTPTS,"
             f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
             f"trim=duration={duration:.6f},"
+            f"fps={fps:g},"
             f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
-            f"fps={fps:g},format=yuv420p[{label}]"
+            f"format=yuv420p[{label}]"
         )
     filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[outv]")
     run_ffmpeg(

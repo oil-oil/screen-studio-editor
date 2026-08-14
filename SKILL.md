@@ -19,20 +19,121 @@ The scripts handle mechanical timeline details. Do not repeat their internal log
 
 ## Visual Defaults
 
-- **`process.py` applies these to the project automatically — you do not set them by hand:** 4:3 output aspect, 2% background padding, 25 window corner radius, and the camera at 30% size, square aspect, pinned top-right. It also runs microphone audio cleanup (noise reduction + volume normalization). It does **not** enable Screen Studio's native captions — subtitles are burned separately in Mode B.
-- Burned subtitles use `PingFang SC`, white text, no text outline, no drop shadow, and a slightly dark translucent rounded background.
+- `process.py` preserves the project's visual layout by default. It applies
+  layout and microphone cleanup only when `visual_defaults.enabled` is true in
+  the user config or `--apply-visual-defaults` is passed. This keeps personal
+  styling out of the public Skill.
+- It does **not** enable Screen Studio's native captions — subtitles are burned
+  separately in Mode B.
+- Mode B 正常烧录时，先用 macOS Vision 对视频均匀抽帧，按“跨帧持续出现在同一位置”
+  自动识别摄像头人脸区域，不假定摄像头在右上角。识别成功后，在同一次 FFmpeg
+  编码中固定执行 10% 轻度磨皮和 10% 提亮，再渲染字幕；不向用户暴露强度参数。
+  检测不到稳定人脸时自动跳过美颜，原画必须保持不变时使用 `--no-beauty`。
+  Draft-only 和 ASS-only 不处理视频。
+- Burned subtitles use `PingFang SC`, white text, no text outline, no drop
+  shadow, and a clearly dark translucent rounded background. Keep the panel
+  compact with narrow inner padding so it supports the text without becoming
+  a large block.
+- Mandarin videos use Chinese-only burned subtitles by default and keep the
+  established single-language size and backing style. Add English only when
+  the user explicitly asks for English or bilingual subtitles. In bilingual
+  mode, Chinese is the larger upper line and English is the lower line at
+  roughly 70% of the Chinese size.
+- Videos strictly longer than three minutes also receive one readable
+  translucent gray progress bar flush with the bottom edge. Use 2–4 broad
+  chapters for 3–5 minute videos and 4–6 for longer videos rather than many
+  small beats. Every chapter title stays visible in the center of its own
+  time-proportional interval while the gray fill advances beneath all titles.
+  Size the bar at about 2.1% of frame height with legible chapter labels; it
+  should remain compact but must not disappear after normal video scaling.
+  Videos at or below three minutes have no chapter bar.
 - Subtitle display text should not include punctuation marks. ASR punctuation may still guide splitting internally, but previewed and burned subtitles should omit visible commas, periods, question marks, exclamation marks, and similar marks.
-- Subtitles are centered near the bottom: roughly a 6% bottom margin for landscape/4:3 video and 20% for portrait. There is no special "safe-area" logic beyond that margin.
+- Subtitles are centered close to the bottom: roughly a 4.5% bottom margin for
+  landscape/4:3 video and 18% for portrait. When a chapter bar exists, preserve
+  a small clear gap above it rather than pushing subtitles high into the frame.
 
 ## Setup
 
 At the start of each session:
 
 ```bash
-SKILL_DIR="/Users/linzhihuang/.claude/skills/screen-studio-editor"
+SKILL_DIR="<absolute directory containing this SKILL.md>"
 PYTHON="$SKILL_DIR/.venv/bin/python3"
 BAILIAN_TRANSCRIBE="$SKILL_DIR/scripts/bailian_transcribe.py"
+SCREEN_STUDIO_EDITOR_CONFIG="${SCREEN_STUDIO_EDITOR_CONFIG:-$HOME/.config/screen-studio-editor/config.json}"
 ```
+
+Never assume a username, home directory, Skill install root, project root, video
+library, model, or creator-preference file. Read optional personal values from
+`SCREEN_STUDIO_EDITOR_CONFIG`; this file stays outside the repository:
+
+```json
+{
+  "projects_root": "/optional/path/to/screen-studio-projects",
+  "video_library_root": "/optional/path/to/video-library",
+  "creator_preferences": "/optional/path/to/creator-edit-preferences.json",
+  "hotwords": "/optional/path/to/hotwords.json",
+  "glossary": "/optional/path/to/glossary.json",
+  "vocabulary_cache": "/optional/path/to/vocabulary-cache.json",
+  "model": "google/gemini-3.5-flash",
+  "smart_edit": {
+    "pause_threshold_ms": 700,
+    "min_pause_ms": 180
+  },
+  "subtitles": {
+    "mode": "zh",
+    "progress_min_duration_seconds": 180
+  },
+  "visual_defaults": {
+    "enabled": false,
+    "output_aspect": [4, 3],
+    "background_padding_ratio": 1.02,
+    "window_border_radius": 25,
+    "camera_aspect_ratio": "square",
+    "camera_size": 0.3,
+    "camera_position": "top-right",
+    "camera_position_point": {"x": 1, "y": 0},
+    "improve_microphone_audio": true
+  },
+  "ppt": {
+    "style_skill": "",
+    "tone_skill": "",
+    "illustration_brief": "",
+    "cutout_script": ""
+  }
+}
+```
+
+Expand `~` after reading paths. Resolution order is command-line argument,
+environment variable, user config, then a portable source-adjacent default.
+Supported overrides include `SCREEN_STUDIO_EDITOR_PREFERENCES` and
+`SCREEN_STUDIO_EDITOR_MODEL`, plus `SCREEN_STUDIO_EDITOR_HOTWORDS`,
+`SCREEN_STUDIO_EDITOR_GLOSSARY`, and
+`SCREEN_STUDIO_EDITOR_VOCABULARY_CACHE`. Subtitle mode resolves from an
+explicit `--subtitle-mode`, then `SCREEN_STUDIO_EDITOR_SUBTITLE_MODE`, then
+`subtitles.mode`, and finally defaults to `zh`. Supported values are `zh` and
+`bilingual`; an explicit user request for English should pass
+`--subtitle-mode bilingual` for that video. The progress threshold resolves
+from `--min-progress-duration`, then
+`SCREEN_STUDIO_EDITOR_PROGRESS_MIN_DURATION`, then
+`subtitles.progress_min_duration_seconds`, and finally 180 seconds. The
+comparison is strict, so a video at exactly 3:00 has no bar. Do not commit the
+user config, API keys, personal absolute paths, creator-specific vocabulary,
+or benchmark data.
+
+Path policy:
+
+- Keep `.screenstudio` projects, merged projects, clones, and project-side
+  editing artifacts under `projects_root` when configured. Otherwise keep
+  derived projects next to the source project.
+- Keep each exported video and its MP4, SRT, ASS, transcript, ASR, cover, and
+  publishing resources together under
+  `<video_library_root>/<video-title>/` when configured. Otherwise keep them
+  next to the source video.
+- Store persistent subtitle work in `<video-stem>.subtitle-work/` beside the
+  video. Use `/tmp` only for disposable frame extractions and caches.
+- When a source is still in an export staging directory, relocate it without
+  overwriting before creating persistent derivatives.
 
 If setup has never been run:
 
@@ -51,10 +152,18 @@ Confirm the provided path exists and contains:
 - `project.json`
 - `recording/`
 
+Set a persistent project-side work directory:
+
+```bash
+PROJECT="/path/to/Project.screenstudio"
+PROJECT_WORK="$PROJECT/.screen-studio-editor"
+mkdir -p "$PROJECT_WORK"
+```
+
 If the user did not specify settings, use:
 
-- `--pause-threshold 800`
-- `--min-pause 300`
+- `--pause-threshold 700`
+- `--min-pause 180`
 - `--pause-source silence`
 - `--asr-backend bailian`
 - `--language zh` for Chinese/Mandarin content
@@ -66,39 +175,58 @@ Start with a dry run. It performs the complete ASR/audio/activity/candidate anal
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh \
   --dry-run \
-  --report-output "/tmp/screenstudio-autoedit-report.json"
+  --report-output "$PROJECT_WORK/autoedit-report.json"
 ```
 
 Read the audit report yourself. Check every protected interval, every reviewed cut, all removals over 5 seconds, and whether the projected time saved is plausible. A first dry run caches its source-time editing transcript beside the report (the exact path is in `edit_transcript_cache`), so reuse it and avoid paying for ASR twice.
 
 For ordinary talking-head/screen-tutorial recordings, the recommended path is
-the cached Gemini-only workflow. It performs the local dry run with a personal
-1,000 ms conservative pause gate, builds one source-aligned A/V proxy, asks
+the cached Gemini-only workflow. It performs the local dry run with the
+configured conservative pause gate (portable default 700 ms), builds one
+source-aligned A/V proxy, asks
 `google/gemini-3.5-flash` for grounded whole-timeline candidates, and runs a
-second cheap text-only pass that exposes Screen Studio's real pause/resume
-session boundaries so an abandoned complete take is not hidden inside the
-concatenated proxy. It learns the creator's light-editing preference from the
-held-out benchmark examples and lets the same personalized arbitration call
-inspect the aligned video before it clears any screen-active or session-aware
-cut. The arbiter must describe the visible action and classify it as meaningful
-or redundant; click/keystroke telemetry constrains the allowed answer and
-remains the stricter final guard. The workflow also adds a conservative local
-micro-edit pass and performs a second dry run. The local pass removes only an
-acoustically isolated strong filler lasting at least 400 ms or a short tail
-take repeated almost exactly; ambiguous short fillers and approximate
-restarts are kept. It does not write the timeline unless `--apply` is
-explicitly added:
+personalized second full-video pass to arbitrate every proposed deletion. It
+does not use Screen Studio pause/resume session boundaries as cut evidence:
+the complete aligned project, transcript, microphone audio, screen activity,
+and creator examples are the evidence. The arbiter must describe the visible
+action and classify it as meaningful or redundant; click/keystroke telemetry
+constrains the allowed answer and remains the stricter final guard. The
+workflow also adds a conservative local micro-edit pass and performs a second
+dry run. The local pass removes only an acoustically isolated strong filler
+lasting at least 400 ms or a short tail take repeated almost exactly;
+ambiguous short fillers and approximate restarts are kept. It does not write
+the timeline unless `--apply` is explicitly added:
+
+This personalized quality path requires `creator_preferences`. If it is not
+configured, build a preferences file with `preference_edit_arbiter.py build`
+or use the direct pause-cleanup path below; do not assume another user's
+benchmark file.
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio"
 ```
+
+There is one editing path: quality mode. ASR, silence/VAD analysis, and
+screen-activity scanning run concurrently inside the local analysis, while the
+aligned-proxy encode stays sequential to avoid CPU contention. When a matching
+source-time edit transcript already exists, a stale analysis cache reuses that
+transcript instead of paying for ASR again. The final audit reuses the first
+pass's fingerprinted silence/activity evidence. It preserves the complete
+reviewed boundary for full-video-cleared screen pauses and replacementless
+local delivery cleanups, while other speech edits still snap to nearby quiet
+waveform points. Any project, transcript, setting, or editor-code mismatch
+falls back to the necessary local rescan.
+
+The review proxy samples each session down to 6 fps before scaling it to the
+960×600 model input. An unchanged cached rerun should reuse the proxy rather
+than encode it again.
 
 Read `smart-edit-final-report.json`, inspect every smart cut and every removal
 over five seconds, then apply the exact cached decisions only when the audit is
@@ -110,39 +238,29 @@ safe:
   --apply
 ```
 
-The workflow reads the ZenMux key from `ZENMUX_API_KEY` or
-`~/.zenmux_api_key`; never put a key in the repository or a report. It reuses
-ASR, the aligned proxy, the full-video and session-aware planner responses, and
-the preference decision whenever their fingerprints still match. It also
+The workflow reads the ZenMux key from `ZENMUX_API_KEY` or an external
+user-home key file supported by the helper script; never put a key in the
+repository or a report. It reuses
+ASR, the aligned proxy, the whole-timeline planner response, and the
+preference decision whenever their fingerprints still match. It also
 fingerprints the project, transcript, cuts, and editor code before the final
 audit, so an unchanged rerun does not repeat the expensive audio/timeline
 validation. The local micro-edit pass does not call an API and normally
 completes in under a second. A final safety
 gate rejects short speech deletions when the model cannot point to a concrete
 repeated or corrected structure; a difficult “maybe retake” stays in the
-video. A fresh five-project July regression measured the cuts that survived
-the final activity guard at about 98.2% time precision and 53.7% coverage of
-the creator's hand cuts (69.4% time F1). Five additional, previously unseen
-June projects reached about 98.2% precision and 79.9% coverage (88.1% F1). A
-harder five-video April/May holdout with 1–9 recording sessions reached 90.4%
-precision and 29.4% coverage (44.4% F1); the unique cuts added by the
-session-aware layer were 96.0% precise. On a 15-session abandoned-take stress
-case, the layer raised coverage from 23.3% to 57.4% while precision moved from
-92.0% to 90.0%. It did not solve subjective long removals inside a single
-continuous session. First-time end-to-end analysis took roughly 3–10.5 minutes
-for the 5–23 minute historical benchmarks; the extra session pass itself
-normally took only 10–20 seconds and about 10k–13k text tokens. An unchanged
-cached rerun previously measured about 0.5–0.6 seconds. Treat all figures as
-regression evidence, not a guarantee for unrelated recording styles.
+video. Keep creator-specific regression measurements in the configured
+preferences or benchmark workspace, not in this public Skill. Never treat
+recording session boundaries as deletions merely to improve recall.
 
 For a recording that genuinely needs pause cleanup only, the direct apply path remains:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/tmp/screenstudio-autoedit-report.transcript.edit.json" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --skip-transcribe "$PROJECT_WORK/autoedit-report.transcript.edit.json" \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh
@@ -154,8 +272,8 @@ If `transcript.edit.json` already exists and you want to reuse the existing edit
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
   --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh
@@ -170,14 +288,14 @@ If `transcript.edit.json` already exists and you want to reuse the existing edit
 - Pause candidates combine **per-session adaptive energy silence** with local **Silero VAD**. VAD catches non-speech gaps that contain fan noise or keyboard sounds; ASR word protection prevents recognized speech from being cut. Screen activity protection is also on by default: click/keystroke files and a low-resolution display-change scan keep silent tutorial actions. Omni-reviewed cuts may clear activity only when the model explicitly marks it redundant and supplies a visual assessment; a claimed `none` never overrides a real input event. Every override is recorded in `reviewed_cuts_activity_clearance_overrides`. Do not pass `--no-vad`, `--no-visual-scan`, or `--no-screen-activity-protection` unless diagnosing a specific failure.
 - The silence threshold defaults to `auto`, estimated separately for every recording session from short-window noise/speech percentiles. Only pass a fixed `--silence-db` when auto misbehaves: lower toward `-35` if speech gets clipped, or raise toward `-20` if pauses remain. `--silence-min-dur` (default 0.3s) is the shortest audio-inactivity region considered.
 - Multi-session recordings (pausing/resuming while recording) are handled: each session's audio runs slightly longer than its slot in the slice timeline, and the script re-anchors ASR and silence timestamps per session. `transcript.json` is saved in **slice-timeline coordinates**, so `start`/`end` values from it can be copied into `cuts.json` as `start_ms`/`end_ms` (×1000) directly.
-- A pause cut never removes anything ASR recognized as a word. Reviewed filler/repeat cuts use nearby low-energy waveform points for their final splice boundaries, but refinement is clamped inside the reviewed range. Structural retake ranges preserve their intentional leading/trailing dead-air up to the clean restart; do not add fixed inward padding to ASR timestamps.
+- A deterministic pause cut never removes anything ASR recognized as a word. Reviewed filler/repeat cuts use nearby low-energy waveform points for their final splice boundaries, but refinement is clamped inside the reviewed range. A full-video-approved screen pause or replacementless local delivery cleanup preserves the complete reviewed range, including intentional adjacent dead air; do not add fixed inward padding to those ranges.
 - New cuts files are schema-v2 objects declaring `coordinate_space` (`source` or `edited`) and a `project_sha256`. `process.py` maps edited/export-time cuts through the exact current `slices` map and refuses mismatched project fingerprints. Legacy list-only cuts are accepted as source time with a warning.
 
 ### 3. Review repeated narration
 
 Read `transcript.edit.json` yourself. Do not ask the user to mark obvious repeats.
 
-Gemini whole-timeline review (default for this creator):
+Gemini whole-timeline review (when `creator_preferences` is configured):
 
 - Candidate discovery and final deletion are separate. Local audio/ASR code
   supplies measured pauses, Gemini supplies long-range semantic hypotheses,
@@ -188,23 +306,30 @@ Gemini whole-timeline review (default for this creator):
 - Speech candidates require valid transcript IDs plus verbatim removed and
   replacement quotes. Model timestamps or reasons that point at different
   words are rejected locally.
-- A screen-active silence of at least two seconds becomes a review hypothesis,
-  not an automatic deletion. Gemini receives 35 seconds of transcript context
-  so an earlier “pause/read/show” instruction protects the complete
-  result-showcase sequence; only high-confidence complete ranges survive the
-  preference arbiter. Keep shorter pauses local. Do not lower this gate to zero:
-  reviewing every pause diluted the prompt and reduced held-out accuracy.
+- Every measured screen-active no-speech interval becomes a review hypothesis,
+  not an automatic deletion. Adjacent fragments split only by a click,
+  keystroke, or handling noise are merged when they have the same transcript
+  context and are at most 1.2 seconds apart. Gemini receives 35 seconds of
+  transcript context and the complete video so an earlier “pause/read/show”
+  instruction can protect a result-showcase sequence.
+- Transcript structure proposes two additional high-recall hypotheses without
+  using a vocabulary list: a punctuated transition unit of at most two content
+  characters after at least 0.6 seconds of silence, and an unpunctuated clause
+  tail of at most four characters/1.2 seconds followed by at least 0.5 seconds
+  of silence. Neither is cut locally; the personalized full-video arbiter must
+  listen across the splice and accept it with high confidence.
 - Continuously changing visuals with almost no mouse/keyboard telemetry are
-  protected even if the model votes to cut; this catches animations, result
-  playback, and passive showcases that look like navigation to a text model.
+  protected unless the full-video arbiter explicitly identifies the visible
+  action and marks it redundant; this catches animations, result playback, and
+  passive showcases while still allowing disposable navigation to be removed.
 - `global_edit_planner.py` and `preference_edit_arbiter.py` cache by exact
   transcript/video/candidate/preference fingerprints. Re-running an unchanged
   project should not pay for the same model decision twice.
 
 Bailian hybrid review (optional deep comparison/fallback):
 
-- Use `qwen3.5-omni-plus` as the primary short-clip reviewer because it hears the microphone and sees the screen. Do not replace it wholesale with a visual-only reasoning model: historical bakeoffs showed that `qwen3.7-plus`/`qwen3.7-max` can miss a spoken restart whose key evidence is delivery and a long pause.
-- The default `--semantic-audit long-cuts` sends Omni's proposed cuts of 15 seconds or longer, all high-risk structural narration cuts (false starts, isolated takes, abandoned sentences, sparse retakes, and explicit self-corrections), and screen-active pauses of at least 5 seconds to `qwen3.7-plus` for an independent semantic veto. This routing is based on candidate risk rather than vocabulary. The audit can downgrade a cut to manual review but can never create a new cut. `qwen3.7-max-2026-06-08` was slower without improving the held-out result, so it is not the default.
+- Use `qwen3.5-omni-plus` as the primary short-clip reviewer because it hears the microphone and sees the screen. Do not replace it wholesale with a visual-only reasoning model when spoken delivery is material evidence.
+- The default `--semantic-audit long-cuts` sends long or high-risk narration cuts and protected screen-active pauses to an independent semantic veto. This routing is based on candidate risk rather than vocabulary. The audit can downgrade a cut to manual review but can never create a new cut.
 - Prefer this when the video has filler words, false starts, or repeated takes that silence detection cannot remove.
 - Candidate search scans the complete timeline, including multi-sentence repeats up to 60 seconds apart, abandoned questions, and short spoken islands bounded by long pauses; it then balances candidates across the recording and reviews them in batches. Do not restore a chronological “first N” cap.
 - Any candidate at or above the semantic-audit threshold is isolated in its own Omni request before the independent audit. This prevents a long explanation from being misclassified because several unrelated candidates diluted the request context.
@@ -214,7 +339,7 @@ Bailian hybrid review (optional deep comparison/fallback):
   grounding, real-silence refinement, creator-preference arbitration, activity
   protection, and a final `process.py` dry run remain mandatory.
 - Fillers use a cheap conservative gate before any model call. Only a single unambiguous hesitation such as `呃/嗯` with at least 120 ms of transcript gap on **both** sides, a 160–900 ms spoken duration, and no overlapping click/keystroke is cut locally. Connected, clustered, ambiguous, or activity-overlapping fillers are preserved; they are not sent to Omni by default. Use `--review-fillers-with-model` only for diagnostic comparison. Weak discourse words such as `这个/然后/其实/的话` and the sentence particle `啊` remain excluded unless `--include-all-fillers` is explicitly requested, and weak fillers still cannot become automatic cuts.
-- Screen-active pauses shorter than 6 seconds are also preserved locally by default (`--protected-pause-min-review-ms 6000`). A five-project hand-edit benchmark showed that these subjective action pauses caused most false positives; the 6-second conservative gate raised aggregate time precision from about 93% to 98%. Longer protected pauses still receive Omni review and the independent semantic audit. Ordinary short silence without screen activity is unaffected and remains eligible for the deterministic pause editor.
+- Screen-active pauses shorter than 6 seconds are preserved locally by default (`--protected-pause-min-review-ms 6000`). Longer protected pauses still receive Omni review and the independent semantic audit. Ordinary short silence without screen activity is unaffected and remains eligible for the deterministic pause editor.
 - Pass the first `process.py` dry-run report through `--activity-report`. Only pauses that were protected because of screen/input activity are added for expensive multimodal review; pauses already handled safely stay local.
 - The reviewer loads the existing Bailian key from `DASHSCOPE_API_KEY` or `~/.bailian/config.json`. With `--video`, it sends compressed short clips to Qwen Omni so the model can hear speech and inspect screen actions together. A separate Screen Studio microphone track can be supplied with `--audio`; the reviewer muxes it into each evidence clip. `qwen3.7-plus` samples long screen clips at 0.5 fps by default to keep the veto fast; it relies on the supplied transcript for speech semantics. Model output remains advisory: timeline validation, deterministic filler/structure gates, activity protection, and waveform boundary refinement run locally. A structurally strong isolated take that receives only medium/low confidence is automatically arbitrated once in its own request; only a high-confidence tie-break is accepted.
 
@@ -225,12 +350,12 @@ For a single-session source-time project, pass the original display and micropho
   --transcript "/path/to/Project.screenstudio/transcript.edit.json" \
   --video "/path/to/Project.screenstudio/recording/channel-2-display-0.mp4" \
   --audio "/path/to/Project.screenstudio/recording/channel-3-microphone-0.m3u8" \
-  --activity-report "/tmp/screenstudio-autoedit-report.json" \
+  --activity-report "$PROJECT_WORK/autoedit-report.json" \
   --coordinate-space source \
   --project-json "/path/to/Project.screenstudio/project.json" \
   --review-backend bailian \
-  --output "/tmp/omni_edit_report.json" \
-  --cuts-output "/tmp/omni_cuts.json"
+  --output "$PROJECT_WORK/omni_edit_report.json" \
+  --cuts-output "$PROJECT_WORK/omni_cuts.json"
 ```
 
 For a **multi-session source-time project**, first build one aligned review
@@ -246,12 +371,12 @@ matches `project.json` even when the encoded source files drift:
   --transcript "/path/to/Project.screenstudio/transcript.edit.json" \
   --video "/path/to/Project.screenstudio/review-proxy/display-timeline.mp4" \
   --audio "/path/to/Project.screenstudio/review-proxy/microphone-timeline.wav" \
-  --activity-report "/tmp/screenstudio-autoedit-report.json" \
+  --activity-report "$PROJECT_WORK/autoedit-report.json" \
   --coordinate-space source \
   --project-json "/path/to/Project.screenstudio/project.json" \
   --review-backend bailian \
-  --output "/tmp/omni_edit_report.json" \
-  --cuts-output "/tmp/omni_cuts.json"
+  --output "$PROJECT_WORK/omni_edit_report.json" \
+  --cuts-output "$PROJECT_WORK/omni_cuts.json"
 ```
 
 If a paid review is interrupted after some batches finish, rerun the identical
@@ -263,22 +388,29 @@ retrying or starting the rest of the batch queue.
 For an **exported edited video**, transcribe that export in raw editing mode and explicitly mark the result as edited time. Never label exported timestamps as source time:
 
 ```bash
+VIDEO="/path/to/exported_edited.mp4"
+VIDEO_DIR="$(dirname "$VIDEO")"
+VIDEO_NAME="$(basename "$VIDEO")"
+VIDEO_STEM="${VIDEO_NAME%.*}"
+SUBTITLE_WORK="$VIDEO_DIR/$VIDEO_STEM.subtitle-work"
+mkdir -p "$SUBTITLE_WORK"
+
 "$PYTHON" "$BAILIAN_TRANSCRIBE" \
-  "/path/to/exported_edited.mp4" \
-  --output "/tmp/exported.edit.json" \
+  "$VIDEO" \
+  --output "$SUBTITLE_WORK/exported.edit.json" \
   --language zh \
   --keep-fillers \
   --no-glossary \
   --split-mode raw
 
 "$PYTHON" "$SKILL_DIR/scripts/gemini_edit_candidates.py" \
-  --transcript "/tmp/exported.edit.json" \
-  --video "/path/to/exported_edited.mp4" \
+  --transcript "$SUBTITLE_WORK/exported.edit.json" \
+  --video "$VIDEO" \
   --coordinate-space edited \
   --project-json "/path/to/Project.screenstudio/project.json" \
   --review-backend bailian \
-  --output "/tmp/omni_edit_report.json" \
-  --cuts-output "/tmp/omni_cuts.json"
+  --output "$PROJECT_WORK/omni_edit_report.json" \
+  --cuts-output "$PROJECT_WORK/omni_cuts.json"
 ```
 
 Apply high-confidence Omni cuts through the existing timeline editor:
@@ -288,15 +420,15 @@ First repeat the dry run with the reviewed cuts and inspect the new audit. This 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/tmp/screenstudio-autoedit-report.transcript.edit.json" \
-  --cuts-file "/tmp/omni_cuts.json" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --skip-transcribe "$PROJECT_WORK/autoedit-report.transcript.edit.json" \
+  --cuts-file "$PROJECT_WORK/omni_cuts.json" \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh \
   --dry-run \
-  --report-output "/tmp/screenstudio-autoedit-final-report.json"
+  --report-output "$PROJECT_WORK/autoedit-final-report.json"
 ```
 
 Then apply the exact same transcript/cuts without `--dry-run`:
@@ -305,15 +437,15 @@ Then apply the exact same transcript/cuts without `--dry-run`:
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
   --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
-  --cuts-file "/tmp/omni_cuts.json" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --cuts-file "$PROJECT_WORK/omni_cuts.json" \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh
 ```
 
-If only deterministic safety or boundary rules changed after a paid review, use `--reuse-review-report /tmp/omni_edit_report.json` to rebuild the cuts without calling the model again. `--review-types` and `--range-start/--range-end` are for targeted calibration; do not use a targeted report as if it were a complete full-timeline review.
+If only deterministic safety or boundary rules changed after a paid review, use `--reuse-review-report "$PROJECT_WORK/omni_edit_report.json"` to rebuild the cuts without calling the model again. `--review-types` and `--range-start/--range-end` are for targeted calibration; do not use a targeted report as if it were a complete full-timeline review.
 
 For model upgrades, use `scripts/model_bakeoff.py` with a labeled manifest whose expected values are kept out of prompts. Compare exact automatic decisions, unsafe false cuts, and mean latency before changing defaults. Never promote a model from anecdotal inspection alone.
 
@@ -338,7 +470,7 @@ mkdir -p /tmp/repeat_frames
 ffmpeg -i "/path/to/video_or_export.mp4" -ss 42 -t 12 -vf "fps=1" /tmp/repeat_frames/frame_%04d.jpg -y
 ```
 
-Write manual repeat cuts as a schema-v2 `/tmp/cuts.json` document. Use `source` only for timestamps copied from `transcript.edit.json`; edited/export timestamps require the matching current-project SHA and should normally be produced by `gemini_edit_candidates.py`:
+Write manual repeat cuts as a schema-v2 `$PROJECT_WORK/cuts.json` document. Use `source` only for timestamps copied from `transcript.edit.json`; edited/export timestamps require the matching current-project SHA and should normally be produced by `gemini_edit_candidates.py`:
 
 ```json
 {
@@ -364,9 +496,9 @@ Apply them:
 "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "/path/to/Project.screenstudio" \
   --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
-  --cuts-file "/tmp/cuts.json" \
-  --pause-threshold 800 \
-  --min-pause 300 \
+  --cuts-file "$PROJECT_WORK/cuts.json" \
+  --pause-threshold 700 \
+  --min-pause 180 \
   --pause-source silence \
   --asr-backend bailian \
   --language zh
@@ -377,15 +509,30 @@ Apply them:
 After processing, check:
 
 - no suspicious short wordless slices remain
-- no obviously bad session-boundary silence remains
+- no obviously bad unexplained dead air remains
 - the reported duration and time saved look reasonable
 - review every `⏱️ long removal` line the script printed: a >5s cut is usually dead air, but confirm from the surrounding transcript (and targeted frames if needed) that it does not hide silent on-screen action; the text shown around long cuts also often reveals an abandoned take that still needs a repeat cut
 
-Tell the user what changed, then ask them to preview the edited project in Screen Studio. The script has already applied the 4:3 layout, 2% padding, 25 rounded corners, 30% top-right square camera, and mic audio cleanup — ask the user to verify these look right (not to set them by hand) before exporting.
+Tell the user what changed, then ask them to preview the edited project in
+Screen Studio. If user-configured visual defaults were enabled, report the
+actual applied values and ask the user to verify them before exporting. If
+disabled, state that the existing layout was preserved.
 
 Do not continue to subtitle burning until the user provides the exported `.mp4`.
 
 ## Mode B: Burn Subtitles Into `.mp4`
+
+Resolve the exported video into its permanent video folder first, then create
+one persistent work directory:
+
+```bash
+VIDEO="/path/to/exported.mp4"
+VIDEO_DIR="$(dirname "$VIDEO")"
+VIDEO_NAME="$(basename "$VIDEO")"
+VIDEO_STEM="${VIDEO_NAME%.*}"
+SUBTITLE_WORK="$VIDEO_DIR/$VIDEO_STEM.subtitle-work"
+mkdir -p "$SUBTITLE_WORK"
+```
 
 ### 1. Transcribe with Bailian ASR
 
@@ -393,10 +540,10 @@ For a standalone video or exported Screen Studio video, use Bailian FunAudio ASR
 
 ```bash
 "$PYTHON" "$BAILIAN_TRANSCRIBE" \
-  "/path/to/exported.mp4" \
-  --output "/tmp/transcript.json" \
+  "$VIDEO" \
+  --output "$SUBTITLE_WORK/transcript.json" \
   --language zh \
-  --raw-output "/tmp/bailian_asr.json"
+  --raw-output "$SUBTITLE_WORK/bailian_asr.json"
 ```
 
 This only replaces the recognition step. The output `transcript.json` keeps the same shape as `local_transcribe.py`: `start`, `end`, `text`, and optional `words`.
@@ -404,18 +551,18 @@ The Bailian transcript is already cleaned of standalone fillers and split into s
 
 Accuracy and segmentation are layered — all on by default, each with an opt-out:
 
-- **Hot words** (`hotwords.json` → Bailian vocabulary, `--no-hotwords` to disable): steers recognition toward the channel's recurring proper nouns. Add a term when ASR keeps mishearing it; do NOT add well-known words ASR already gets right (a hot word can hijack similar-sounding speech — 飞书 as a hot word turned "Fable" into 飞书). The vocabulary is cached in `.vocabulary-cache.json` and auto-updates when `hotwords.json` changes.
-- **Glossary auto-apply** (`glossary.json`, `--no-glossary` to disable): recurring text corrections applied to segment text right after ASR, so the preview shows corrected subtitles. Matching is case-insensitive and whitespace-tolerant. The same replacements run again at burn time (idempotent).
+- **Hot words** (configured `hotwords` file, or `--hotwords`; `--no-hotwords` to disable): steers recognition toward the user's recurring proper nouns. Public default is empty. The remote vocabulary cache stays outside the Skill at configured `vocabulary_cache` or the user cache directory.
+- **Glossary auto-apply** (configured `glossary` file, or `--glossary`; `--no-glossary` to disable): recurring text corrections applied to segment text right after ASR, so the preview shows corrected subtitles. Public default is empty. Matching is case-insensitive and whitespace-tolerant. The same replacements run again at burn time (idempotent).
 - **LLM line splitting** (`--split-mode llm` default, `rules` to disable; `--split-model` to override): over-long ASR sentences are split into subtitle lines by Qwen, sentence by sentence in parallel — the LLM only chooses break points; character content is validated and any failed sentence falls back to the rule splitter. Expect a handful of "LLM split modified the text" warnings on stuttery sentences; that is the validation working, not an error.
 - `--split-mode raw` is for editing analysis only. It preserves punctuation, fillers, and ASR sentence boundaries and must not be sent directly to the subtitle preview/burn workflow.
 
 If the user explicitly asks to compare with the old local model or Bailian is temporarily unavailable, the existing local transcription path is still available:
 
 ```bash
-ffmpeg -i "/path/to/exported.mp4" -ar 16000 -ac 1 /tmp/audio_for_transcribe.wav -y
+ffmpeg -i "$VIDEO" -ar 16000 -ac 1 "$SUBTITLE_WORK/audio_for_transcribe.wav" -y
 "$PYTHON" "$SKILL_DIR/scripts/local_transcribe.py" \
-  --audio /tmp/audio_for_transcribe.wav \
-  --output /tmp/transcript.json \
+  --audio "$SUBTITLE_WORK/audio_for_transcribe.wav" \
+  --output "$SUBTITLE_WORK/transcript.json" \
   --language zh
 ```
 
@@ -428,75 +575,154 @@ Read the transcript before previewing. Apply high-confidence corrections directl
 - obvious proper nouns and product names
 - clear ASR mistakes from context
 - wrong capitalization such as `github` -> `GitHub`
-- recurring misrecognitions from `glossary.json` if present
+- recurring misrecognitions from the configured glossary if present
 
 For uncertain product names, commands, filenames, or visible UI text, extract targeted frames and verify before changing.
 
 Only edit the segment `"text"` fields. Ignore word-level tokens unless debugging timing.
 The previewed segment `"text"` is the source of truth for burned display text. Word-level tokens may guide timing, but they must not overwrite casing, product-name corrections, spacing, or other user-confirmed text edits.
 
-### 3. Launch preview editor
+### 3. Prepare subtitles and broad chapters
+
+Chinese-only subtitles are the default. The preparation command reads the
+configured subtitle mode and creates one generic transcript and manifest. It
+still plans broad chapters for videos longer than three minutes, so turning off
+English does not turn off the progress bar:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/prepare_subtitles.py" \
+  --transcript "$SUBTITLE_WORK/transcript.json" \
+  --video "$VIDEO" \
+  --output "$SUBTITLE_WORK/subtitle-transcript.json" \
+  --chapters-output "$SUBTITLE_WORK/subtitle-chapters.json" \
+  --manifest-output "$SUBTITLE_WORK/subtitle-manifest.json" \
+  --work-dir "$SUBTITLE_WORK/subtitle-cache" \
+  --resume
+```
+
+Only when the user explicitly asks for English or bilingual subtitles, add:
+
+```bash
+  --subtitle-mode bilingual
+```
+
+Do not infer bilingual mode from the video's destination platform or from a
+previous video. Read the prepared transcript and chapters yourself. In
+bilingual mode, correct clear translation errors. In both modes, confirm that
+chapters describe major content phases and are not fragmented. For videos
+between three and five minutes, prefer 2–4 sections; for longer videos, prefer
+4–6 sections. Sections should normally last at least 75 seconds. Keep every
+title concise. The preview reads
+`subtitle-chapters.json` through the manifest, so chapter edits stay aligned
+with the final burn.
+
+### 4. Launch preview editor
 
 The user must preview synced subtitles before burning. `preview_editor.py` runs a Flask server that **blocks**, so start it in the background and keep going:
 
 ```bash
 lsof -ti :8765 | xargs kill -9 2>/dev/null; sleep 1
 "$PYTHON" "$SKILL_DIR/scripts/preview_editor.py" \
-  "/path/to/exported.mp4" \
-  "/tmp/transcript.json" &
+  "$SUBTITLE_WORK/subtitle-manifest.json" &
 ```
 
-Open or provide `http://localhost:8765`. The page targets the Oil/ego-browser interactive bridge: when the user clicks 「保存并关闭」 it writes the edited `transcript.json` and signals the Agent. In a plain browser that signal may not arrive — in that case watch `transcript.json`'s modification time (it is rewritten on save) to know when the user is done.
+Always use the current video's own `.subtitle-work/subtitle-manifest.json`; never
+reuse a generic transcript path from another video. Restart the preview server
+for each new video. The editor sends `Cache-Control: no-store` and fingerprints
+the transcript in its browser cache key. If an old page remains open, close it
+and open `http://localhost:8765/?v=<new-fingerprint>`. Verify that the first
+subtitle matches the current video's opening narration before editing.
+If another preview process or an app-managed session owns port 8765, launch
+with `PREVIEW_EDITOR_PORT=8766` and open `http://localhost:8766/` instead of
+trying to kill or reuse the other session.
+
+Open or provide `http://localhost:8765`. The page targets the Oil/ego-browser interactive bridge: when the user clicks 「保存并关闭」 it writes the prepared subtitle transcript and signals the Agent. In a plain browser that signal may not arrive — in that case watch `subtitle-transcript.json`'s modification time to know when the user is done.
 
 Tell the user:
 
 > 已打开字幕预览编辑器，请检查字幕是否准确。可以双击编辑文字、勾选删除不需要的条目。确认无误后点击「保存并关闭」，我再继续烧录。
 
-Wait until the user confirms or the preview editor saves (`transcript.json` is rewritten).
+Wait until the user confirms or the preview editor saves
+(`subtitle-transcript.json` is rewritten).
 
-### 4. Update glossary if useful
+### 5. Update glossary if useful
 
-After the user saves, compare `transcript.json.orig.json` with `transcript.json`.
+After the user saves, compare `subtitle-transcript.json.orig.json` with
+`subtitle-transcript.json`. In bilingual mode, use only Chinese-side
+corrections as evidence for the source glossary.
 
-Add only recurring ASR mistakes to `glossary.json`. Do not add one-off content edits, deletions, or punctuation tweaks.
+Add only recurring ASR mistakes to the user-configured glossary. Do not add one-off content edits, deletions, or punctuation tweaks, and do not write personal corrections into the Skill repository.
 
-### 5. Draft and burn
+### 6. Draft and burn
 
-Generate an SRT draft first:
+For the default Chinese-only path, generate an SRT draft first:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/burn_subtitles.py" \
-  --video "/path/to/exported.mp4" \
-  --transcript "/tmp/transcript.json" \
-  --draft-output "/path/to/exported_subtitled.srt" \
+  --video "$VIDEO" \
+  --transcript "$SUBTITLE_WORK/subtitle-transcript.json" \
+  --chapters "$SUBTITLE_WORK/subtitle-chapters.json" \
+  --draft-output "$VIDEO_DIR/${VIDEO_STEM}_subtitled.srt" \
   --draft-only
 ```
 
-Read the draft. Check for:
-
-- obvious bad line breaks
-- zero-length or overlapping events
-- stranded particles
-- product names split badly
-- subtitle lines ending with display punctuation
-
-Then burn:
+Read the draft and check line breaks, timing, stranded particles, product names,
+and visible punctuation. Then generate the ASS, inspect representative frames,
+and burn:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/burn_subtitles.py" \
-  --video "/path/to/exported.mp4" \
-  --transcript "/tmp/transcript.json"
+  --video "$VIDEO" \
+  --transcript "$SUBTITLE_WORK/subtitle-transcript.json" \
+  --chapters "$SUBTITLE_WORK/subtitle-chapters.json" \
+  --output "$VIDEO_DIR/${VIDEO_STEM}_subtitled.mp4" \
+  --ass-only
+
+"$PYTHON" "$SKILL_DIR/scripts/burn_subtitles.py" \
+  --video "$VIDEO" \
+  --transcript "$SUBTITLE_WORK/subtitle-transcript.json" \
+  --chapters "$SUBTITLE_WORK/subtitle-chapters.json" \
+  --output "$VIDEO_DIR/${VIDEO_STEM}_subtitled.mp4"
 ```
+
+For explicit bilingual mode, use the prepared transcript with the bilingual
+burner:
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/burn_bilingual_subtitles.py" \
+  --video "$VIDEO" \
+  --transcript "$SUBTITLE_WORK/subtitle-transcript.json" \
+  --chapters "$SUBTITLE_WORK/subtitle-chapters.json" \
+  --output "$VIDEO_DIR/${VIDEO_STEM}_bilingual.mp4"
+```
+
+Verify the selected language mode, ensure subtitles do not cover the persistent
+camera region, and confirm that every chapter title remains fixed in its own
+time-proportional interval. The progress fill may move; titles must not
+dynamically replace one another.
+
+正常烧录会用 macOS Vision 自动识别跨抽样帧持续出现的摄像头人脸区域，位置不限；
+识别成功后固定执行 10% 轻度磨皮和 10% 提亮。检测不到稳定人脸就跳过美颜，
+不要猜测固定角落，也不要临时设计或调整参数。原画必须保持不变时传入
+`--no-beauty`。
 
 If the user reviewed or edited the SRT draft directly, burn that reviewed file:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/burn_subtitles.py" \
-  --video "/path/to/exported.mp4" \
-  --srt-input "/path/to/exported_subtitled.srt"
+  --video "$VIDEO" \
+  --srt-input "$VIDEO_DIR/${VIDEO_STEM}_subtitled.srt"
 ```
 
-The output is saved next to the source video as `<video>_subtitled.mp4`.
+`--srt-input` treats the reviewed SRT as immutable source of truth. It preserves
+caption text, capitalization, punctuation, line breaks, and timing exactly; it
+bypasses glossary replacement, punctuation stripping, CJK spacing, noise-line
+filtering, rewrapping, and timing normalization. Invalid, overlapping, empty,
+or non-positive cues fail before encoding instead of being silently rewritten.
+Do not regenerate a reviewed SRT from the transcript before burning.
+
+The Chinese-only output is `<video>_subtitled.mp4`; explicit bilingual output
+is `<video>_bilingual.mp4`.
 
 ## Mode C: Merge Projects
 
@@ -506,7 +732,9 @@ Ask for:
 - supplement `.screenstudio`
 - append at end or insert after a specific slice
 
-Append by default:
+Resolve `PROJECTS_ROOT` from user config. If configured, both inputs and the
+merged output belong there; if not configured, keep the merged output beside
+the base project. Append by default:
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/merge_projects.py" \
@@ -520,7 +748,7 @@ For a custom output:
 "$PYTHON" "$SKILL_DIR/scripts/merge_projects.py" \
   --base "/path/to/Base.screenstudio" \
   --supplement "/path/to/Supplement.screenstudio" \
-  --output "/path/to/Merged.screenstudio"
+  --output "$PROJECTS_ROOT/Merged.screenstudio"
 ```
 
 For insertion:
@@ -532,9 +760,71 @@ For insertion:
   --insert-after-slice 5
 ```
 
-The merged project is written to `<Base>_Merged.screenstudio` by default. If the output already exists the script aborts (it never prompts interactively) — pass `--force` to overwrite.
+The merged project is written beside the base as `<Base>_Merged.screenstudio`
+by default. When `projects_root` is configured and the base is elsewhere,
+always pass an output inside that root. If the output already exists the script
+aborts (it never prompts interactively) — pass `--force` only after explicitly
+confirming replacement.
 
 After merging, tell the user to open the merged project in Screen Studio, arrange slices if needed, then continue with Mode A.
+
+## Mode D: Auto-build a PPT for a talking-head recording (portrait-first)
+
+Use this when the user has a **pure talking-head Screen Studio recording** (audio + camera; the screen was just a placeholder) and wants a slide deck built *around what they said*, burned into the screen track. The deck follows the narration — not the reverse. Primary output is **3:4 portrait** (小红书 / 抖音 竖版); landscape works too.
+
+Read `reference/screenstudio-project-format.md` first — project structure,
+display-replacement mechanics, page-alignment math, zoom format, hide-cursor.
+**Always work on a clone** (`cp -Rc`); original stays read-only. Put the clone
+under configured `projects_root`, or beside the source project when no root is
+configured.
+
+### 1. Transcribe
+Bailian ASR on the audio → segments on the **edited (成片) timeline**. Everything aligns to this timeline.
+
+### 2. Understand the talk, then plan slides
+Read the transcript yourself. Split into sections; one slide per point. For each slide record its **成片 start time** (when the user starts talking about it). If the narration references a real website / product / repo, use **`/ego-browser`** to fetch real screenshots / info for the slide — don't fake UI.
+
+### 3. Design the deck
+
+Read optional `ppt` settings from the user config. Use `style_skill`,
+`tone_skill`, `illustration_brief`, and `cutout_script` only when configured
+and available; never hardcode a personal style system, character, external
+Skill, or local script into the public workflow. Without those settings,
+follow the user's request or use a clean editorial presentation style.
+
+Every slide needs a useful visual: icons, illustration, UI mock, or real web
+screenshot. Avoid walls of text. When the narration references a real product
+or site, use an available browser tool to capture real evidence rather than
+inventing UI.
+
+### 排版铁律 (portrait — this is exactly where text goes too small)
+- **One point per slide.** Info-dense content (number walls, multi-row grids) is split across 2–3 slides, never crammed onto one.
+- **Minimum readable size** (phone viewing): on a 1080-wide stage, title ≥ 64px, body ≥ 30px, any label ≥ 24px. If it doesn't fit, **cut content — never shrink the font**.
+- Portrait = 大字少字. Landscape may use two-column layouts and more density.
+- Fixed stage designed at 1080×1440, rendered at 1260×1680 (matches display encode). Use `?slide=N` for per-page rendering; entrance animations use CSS + staggered `animation-delay`.
+
+### 4. Render pages + write plan.json
+Render each slide to `deckNN.png` (Chrome headless, `?slide=N`, `--virtual-time-budget` long enough for entrance animations to settle to their end state). Then `plan.json`:
+- `page_starts`: `[[成片秒, 页号], …]` from step 2 — this is the 翻页 timetable.
+- `zooms`: **~1.2×** on slides with a focal area (icon grid, a key number, a screenshot). `manualTargetPoint {x,y}` normalized on the deck; time window on the 成片 timeline. Don't zoom every slide — only where there's detail worth seeing.
+- `orientation` (portrait / landscape), `width`, `height`, `fade` (~0.45s), `hide_cursor: true`.
+
+### 5. Replace
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/auto_ppt_replace.py" \
+  --project "/path/Clone.screenstudio" \
+  --pages   "/path/rendered_pages" \
+  --plan    "/path/plan.json"
+```
+Aligns pages to the source timeline, adds per-page fade-in-from-white, replaces display (full mp4 + HLS, all sessions), rewrites `bounds` to 3:4 for portrait, hides cursor, writes the 1.2× zooms.
+
+### 6. Hand off
+Tell the user to **fully quit Screen Studio (Cmd+Q) and reopen the clone** — it caches display in memory, so an in-app reopen alone often shows the stale picture. They preview, nudge, export. Burn subtitles via Mode B.
+
+**Notes**
+- Portrait fills the 3:4 canvas only because the script rewrites display `bounds` to the deck ratio — verified to work, but it is the one step Screen Studio could reject on a version change; confirm in-app.
+- User usually moves the camera to a corner (bottom-right) for portrait — keep that corner of the deck light.
+- Zoom `type` stays `"follow-click-groups"` + `manualTargetPoint` (no click data → it uses the point). Don't invent a "manual" type.
 
 ## Reporting
 

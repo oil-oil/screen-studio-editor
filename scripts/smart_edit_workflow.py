@@ -6,17 +6,23 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
+from process import analysis_cache_signature
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = "google/gemini-3.5-flash"
-WORKFLOW_VERSION = 3
-DEFAULT_PREFERENCES = Path(
-    "~/Screen Studio Projects/AutoEdit Benchmarks/creator-edit-preferences.json"
+WORKFLOW_VERSION = 16
+USER_CONFIG_FILE = Path(
+    os.environ.get(
+        "SCREEN_STUDIO_EDITOR_CONFIG",
+        str(Path.home() / ".config" / "screen-studio-editor" / "config.json"),
+    )
 ).expanduser()
 
 
@@ -26,6 +32,18 @@ def fail(message: str) -> None:
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_user_config() -> dict[str, Any]:
+    if not USER_CONFIG_FILE.exists():
+        return {}
+    try:
+        payload = load_json(USER_CONFIG_FILE)
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"Invalid user config {USER_CONFIG_FILE}: {exc}")
+    if not isinstance(payload, dict):
+        fail(f"User config must be a JSON object: {USER_CONFIG_FILE}")
+    return payload
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -48,16 +66,22 @@ def project_sha256(project: Path) -> str:
 
 
 def final_audit_signature(
-    project: Path, cuts_path: Path, transcript: Path
+    project: Path,
+    cuts_path: Path,
+    transcript: Path,
+    baseline_report: Path,
+    pause_threshold_ms: float = 700,
+    min_pause_ms: float = 180,
 ) -> str:
     payload = {
         "workflow_version": WORKFLOW_VERSION,
         "project_sha256": project_sha256(project),
         "cuts_sha256": file_sha256(cuts_path),
         "transcript_sha256": file_sha256(transcript),
+        "baseline_report_sha256": file_sha256(baseline_report),
         "process_sha256": file_sha256(SCRIPT_DIR / "process.py"),
-        "pause_threshold_ms": 1000,
-        "min_pause_ms": 300,
+        "pause_threshold_ms": pause_threshold_ms,
+        "min_pause_ms": min_pause_ms,
         "pause_source": "silence",
     }
     return hashlib.sha256(
@@ -82,11 +106,38 @@ def run(command: list[str], description: str) -> None:
         fail(f"{description} failed.\n{details}")
 
 
-def baseline_is_current(project: Path, report: Path, transcript: Path) -> bool:
+def baseline_is_current(
+    project: Path,
+    report: Path,
+    transcript: Path,
+    pause_threshold_ms: float = 700,
+    min_pause_ms: float = 180,
+) -> bool:
     if not report.exists() or not transcript.exists():
         return False
     try:
-        return load_json(report).get("project_sha256") == project_sha256(project)
+        payload = load_json(report)
+        expected_analysis_signature = analysis_cache_signature(
+            project / "project.json",
+            transcript,
+            argparse.Namespace(
+                pause_threshold=pause_threshold_ms,
+                min_pause=min_pause_ms,
+                pause_source="silence",
+                silence_db="auto",
+                silence_min_dur=0.3,
+                no_vad=False,
+                no_screen_activity_protection=False,
+                no_visual_scan=False,
+                visual_scan_fps=2.5,
+                visual_change_threshold=0.012,
+            ),
+        )
+        return (
+            payload.get("project_sha256") == project_sha256(project)
+            and payload.get("analysis_cache_signature")
+            == expected_analysis_signature
+        )
     except (OSError, json.JSONDecodeError, TypeError):
         return False
 
@@ -114,6 +165,14 @@ def candidate_cut(candidate: dict[str, Any], *, local: bool = False) -> dict[str
     for key in ("screen_action", "visual_assessment", "source_report"):
         if candidate.get(key):
             cut[key] = candidate[key]
+    if (
+        candidate.get("planner_category") == "screen_pause"
+        or (
+            candidate.get("replacementless_local_cleanup")
+            and not candidate.get("refine_speech_boundaries")
+        )
+    ):
+        cut["preserve_reviewed_boundaries"] = True
     if local:
         cut["local_micro_decision"] = True
     else:
@@ -159,14 +218,37 @@ def cuts_document(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, required=True)
-    parser.add_argument("--preferences", type=Path, default=DEFAULT_PREFERENCES)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--preferences", type=Path)
+    parser.add_argument("--model")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force-analysis", action="store_true")
     args = parser.parse_args()
 
+    config = load_user_config()
     project = args.project.expanduser().resolve()
-    preferences = args.preferences.expanduser().resolve()
+    configured_preferences = (
+        args.preferences
+        or os.environ.get("SCREEN_STUDIO_EDITOR_PREFERENCES")
+        or config.get("creator_preferences")
+    )
+    if not configured_preferences:
+        fail(
+            "Creator preferences are not configured. Pass --preferences, set "
+            "SCREEN_STUDIO_EDITOR_PREFERENCES, or set creator_preferences in "
+            f"{USER_CONFIG_FILE}."
+        )
+    preferences = Path(configured_preferences).expanduser().resolve()
+    model = (
+        args.model
+        or os.environ.get("SCREEN_STUDIO_EDITOR_MODEL")
+        or config.get("model")
+        or DEFAULT_MODEL
+    )
+    smart_edit_config = config.get("smart_edit") or {}
+    if not isinstance(smart_edit_config, dict):
+        fail(f"smart_edit config must be a JSON object: {USER_CONFIG_FILE}")
+    pause_threshold_ms = float(smart_edit_config.get("pause_threshold_ms", 700))
+    min_pause_ms = float(smart_edit_config.get("min_pause_ms", 180))
     if not (project / "project.json").exists() or not (project / "recording").is_dir():
         fail(f"Not a Screen Studio project: {project}")
     if not preferences.exists():
@@ -177,90 +259,87 @@ def main() -> None:
 
     baseline_report = project / "baseline-report.json"
     transcript = project / "baseline-report.transcript.edit.json"
-    planner_report = project / "global-video-planner-gemini35flash-v4.json"
-    planner_work = project / "global-video-work-gemini35flash-v4"
-    session_report = project / "session-text-planner-gemini35flash-v1.json"
-    session_work = project / "session-text-work-gemini35flash-v1"
+    planner_report = project / "global-video-planner-v11.json"
+    planner_work = project / "global-video-work-v11"
     structured_report = project / "structured-edit-candidates-v1.json"
     arbiter_report = project / "smart-edit-report.json"
     cuts_path = project / "smart-edit-cuts.json"
     final_report = project / "smart-edit-final-report.json"
 
-    if args.force_analysis or not baseline_is_current(
-        project, baseline_report, transcript
-    ):
-        run(
-            [
-                sys.executable,
-                str(SCRIPT_DIR / "process.py"),
-                "--project", str(project),
-                "--pause-threshold", "1000",
-                "--min-pause", "300",
-                "--pause-source", "silence",
-                "--asr-backend", "bailian",
-                "--language", "zh",
-                "--dry-run",
-                "--report-output", str(baseline_report),
-            ],
-            "local audio, transcript, and activity analysis",
+    baseline_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "process.py"),
+        "--project", str(project),
+        "--pause-threshold", str(pause_threshold_ms),
+        "--min-pause", str(min_pause_ms),
+        "--pause-source", "silence",
+        "--asr-backend", "bailian",
+        "--language", "zh",
+        "--dry-run",
+        "--report-output", str(baseline_report),
+    ]
+    if transcript.exists():
+        baseline_command.extend(["--skip-transcribe", str(transcript)])
+    proxy_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "build_review_proxy.py"),
+        str(project),
+    ]
+    structured_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "structured_edit_candidates.py"),
+        "--transcript", str(transcript),
+        "--activity-report", str(baseline_report),
+        "--output", str(structured_report),
+    ]
+    baseline_current = (
+        not args.force_analysis
+        and baseline_is_current(
+            project,
+            baseline_report,
+            transcript,
+            pause_threshold_ms,
+            min_pause_ms,
         )
-    else:
-        print("[smart-edit] Reusing current baseline analysis.")
-
-    run(
-        [sys.executable, str(SCRIPT_DIR / "build_review_proxy.py"), str(project)],
-        "aligned review proxy",
     )
+    if baseline_current:
+        print("[smart-edit] Reusing current baseline analysis.")
+        run(proxy_command, "aligned review proxy")
+    else:
+        run(baseline_command, "local audio, transcript, and activity analysis")
+        run(proxy_command, "aligned review proxy")
     run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "structured_edit_candidates.py"),
-            "--transcript", str(transcript),
-            "--activity-report", str(baseline_report),
-            "--output", str(structured_report),
-        ],
+        structured_command,
         "conservative local filler and exact-repeat micro edits",
     )
+
     combined_video = project / "review-proxy" / "combined-timeline.mp4"
+    planner_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "global_edit_planner.py"),
+        "--transcript", str(transcript),
+        "--output", str(planner_report),
+        "--work-dir", str(planner_work),
+        "--model", model,
+        "--resume",
+        "--video", str(combined_video),
+    ]
+    run(planner_command, "Gemini whole-timeline paper edit")
+    arbiter_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "preference_edit_arbiter.py"),
+        "decide",
+        "--project", str(project),
+        "--preferences", str(preferences),
+        "--output", str(arbiter_report),
+        "--model", model,
+        "--candidate-source", "global",
+        "--protected-pause-min-ms", "0",
+        "--video", str(combined_video),
+        "--resume",
+    ]
     run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "global_edit_planner.py"),
-            "--transcript", str(transcript),
-            "--video", str(combined_video),
-            "--output", str(planner_report),
-            "--work-dir", str(planner_work),
-            "--model", args.model,
-            "--resume",
-        ],
-        "Gemini whole-timeline paper edit",
-    )
-    run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "session_edit_planner.py"),
-            "--project", str(project),
-            "--transcript", str(transcript),
-            "--output", str(session_report),
-            "--work-dir", str(session_work),
-            "--model", args.model,
-            "--resume",
-        ],
-        "Gemini session-aware transcript paper edit",
-    )
-    run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "preference_edit_arbiter.py"),
-            "decide",
-            "--project", str(project),
-            "--preferences", str(preferences),
-            "--output", str(arbiter_report),
-            "--model", args.model,
-            "--candidate-source", "global",
-            "--video", str(combined_video),
-            "--resume",
-        ],
+        arbiter_command,
         "Gemini creator-style arbitration",
     )
 
@@ -278,16 +357,24 @@ def main() -> None:
         str(SCRIPT_DIR / "process.py"),
         "--project", str(project),
         "--skip-transcribe", str(transcript),
+        "--reuse-analysis-report", str(baseline_report),
         "--cuts-file", str(cuts_path),
-        "--pause-threshold", "1000",
-        "--min-pause", "300",
+        "--pause-threshold", str(pause_threshold_ms),
+        "--min-pause", str(min_pause_ms),
         "--pause-source", "silence",
         "--asr-backend", "bailian",
         "--language", "zh",
     ]
     if not args.apply:
         final_command.extend(["--dry-run", "--report-output", str(final_report)])
-    audit_signature = final_audit_signature(project, cuts_path, transcript)
+    audit_signature = final_audit_signature(
+        project,
+        cuts_path,
+        transcript,
+        baseline_report,
+        pause_threshold_ms,
+        min_pause_ms,
+    )
     if not args.apply and final_audit_is_current(final_report, audit_signature):
         print("[smart-edit] Reusing current final timeline audit.")
     else:
@@ -304,10 +391,11 @@ def main() -> None:
     report = load_json(final_report) if final_report.exists() and not args.apply else {}
     summary = {
         "project": str(project),
-        "model": args.model,
+        "model": model,
+        "mode": "quality",
         "applied": args.apply,
         "planner_candidates": load_json(planner_report).get("candidate_count"),
-        "session_candidates": load_json(session_report).get("candidate_count"),
+        "full_video_model_uploads": 3,
         "structured_candidates": load_json(structured_report).get("candidate_count"),
         "local_micro_cuts": sum(
             bool(item.get("local_micro_decision"))

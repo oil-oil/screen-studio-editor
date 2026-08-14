@@ -22,7 +22,7 @@ from flask import (
 # ----------------------------------------------------------------------------- #
 # Config
 # ----------------------------------------------------------------------------- #
-PORT = 8765
+PORT = int(os.environ.get("PREVIEW_EDITOR_PORT", "8765"))
 TRANSCRIPT_PATH = None
 VIDEO_PATH = None
 MANIFEST = None       # 多语言模式:解析后的 manifest dict
@@ -124,7 +124,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .video-wrap video { width: 100%; height: 100%; object-fit: contain; }
   .current-subtitle {
     position: absolute;
-    bottom: 6%;
+    bottom: 4.5%;
     left: 50%;
     transform: translateX(-50%);
     max-width: 90%;
@@ -133,8 +133,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font-size: clamp(13px, 2.2vw, 22px);
     line-height: 1.5;
     color: #ffffff;
-    background: rgba(32, 32, 32, 0.62);
-    padding: 4px 14px 6px;
+    background: rgba(26, 26, 28, 0.76);
+    padding: 4px 10px;
     border-radius: 4px;
     pointer-events: none;
     white-space: pre-wrap;
@@ -143,6 +143,75 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     display: none;
   }
   .current-subtitle.visible { display: block; }
+  .current-subtitle-zh { font-size: 1em; font-weight: 600; line-height: 1.34; }
+  .current-subtitle-en {
+    margin-top: 1px;
+    color: rgba(255,255,255,.90);
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    font-size: .78em;
+    font-weight: 500;
+    line-height: 1.28;
+  }
+  .bilingual-mode .current-subtitle { text-shadow: none; }
+  .sub-text-zh { color: #16161f; font-size: 14px; line-height: 1.55; }
+  .sub-text-en {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .content-progress {
+    position: absolute;
+    z-index: 5;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 22px;
+    display: none;
+    overflow: hidden;
+    border-top: 1px solid rgba(255,255,255,.16);
+    background: rgba(54,54,58,.62);
+    pointer-events: none;
+  }
+  .content-progress.visible { display: block; }
+  .content-progress-fill {
+    position: absolute;
+    z-index: 1;
+    inset: 0 auto 0 0;
+    width: 0;
+    background: rgba(198,198,204,.50);
+  }
+  .content-progress-markers { position: absolute; z-index: 2; inset: 0; }
+  .content-progress-marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: rgba(255,255,255,.40);
+  }
+  .content-progress-labels {
+    position: absolute;
+    z-index: 3;
+    inset: 0;
+  }
+  .content-progress-label {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 0 2px;
+    color: rgba(255,255,255,.94);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: .02em;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   /* ---- list pane: always-visible right panel ---- */
   .list-pane {
@@ -443,6 +512,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="video-wrap">
       <video id="vid" controls src="/video"></video>
       <div class="current-subtitle" id="curSub"></div>
+      <div class="content-progress" id="contentProgress">
+        <div class="content-progress-fill" id="contentProgressFill"></div>
+        <div class="content-progress-markers" id="contentProgressMarkers"></div>
+        <div class="content-progress-labels" id="contentProgressLabels"></div>
+      </div>
     </div>
   </div>
 
@@ -498,6 +572,8 @@ let findIndex = -1;
 let currentNeedle = '';
 let manifest = null;       // 多语言 manifest
 let currentLang = null;    // 当前语言 code
+let bilingualMode = false;
+let chapters = [];
 
 // ── DOM ─────────────────────────────────────────────────────────────────────
 const vid        = document.getElementById('vid');
@@ -512,6 +588,10 @@ const listPane   = document.getElementById('listPane');
 const videoPaneEl = document.getElementById('videoPaneEl');
 const dubAudio   = document.getElementById('dubAudio');
 const langTabs   = document.getElementById('langTabs');
+const contentProgress = document.getElementById('contentProgress');
+const contentProgressFill = document.getElementById('contentProgressFill');
+const contentProgressMarkers = document.getElementById('contentProgressMarkers');
+const contentProgressLabels = document.getElementById('contentProgressLabels');
 
 // ── find bar toggle (Ctrl+F) ──────────────────────────────────────────────────
 const findBarEl = document.getElementById('findBar');
@@ -567,13 +647,79 @@ function getVisibleSegments() {
   return segments.filter(s => !deletedIds.has(s._id));
 }
 
+function segmentFields() {
+  return bilingualMode ? ['zh', 'en'] : ['text'];
+}
+
+function segmentSearchText(seg) {
+  return segmentFields().map(field => seg[field] || '').join('\n');
+}
+
+function renderCurrentSubtitle(seg) {
+  curSub.replaceChildren();
+  if (!seg) {
+    curSub.classList.remove('visible');
+    return;
+  }
+  if (bilingualMode) {
+    const zh = document.createElement('div');
+    zh.className = 'current-subtitle-zh';
+    zh.textContent = (seg.zh || '').trim();
+    const en = document.createElement('div');
+    en.className = 'current-subtitle-en';
+    en.textContent = (seg.en || '').trim();
+    curSub.append(zh, en);
+  } else {
+    curSub.textContent = (seg.text || '').trim();
+  }
+  curSub.classList.add('visible');
+}
+
+function setupContentProgress() {
+  const duration = Number(manifest.duration || 0);
+  const minDuration = Number(manifest.min_progress_duration ?? 180);
+  const enabled = duration > minDuration && chapters.length > 1;
+  contentProgress.classList.toggle('visible', enabled);
+  contentProgressMarkers.replaceChildren();
+  contentProgressLabels.replaceChildren();
+  if (!enabled) return;
+  chapters.forEach((chapter, index) => {
+    const startPercent = Math.max(0, Math.min(100, Number(chapter.start) / duration * 100));
+    const endPercent = Math.max(startPercent, Math.min(100, Number(chapter.end) / duration * 100));
+    if (index > 0) {
+      const marker = document.createElement('span');
+      marker.className = 'content-progress-marker';
+      marker.style.left = `${startPercent}%`;
+      contentProgressMarkers.appendChild(marker);
+    }
+    const label = document.createElement('span');
+    label.className = 'content-progress-label';
+    label.style.left = `${startPercent}%`;
+    label.style.width = `${endPercent - startPercent}%`;
+    label.textContent = chapter.title || `第 ${index + 1} 节`;
+    contentProgressLabels.appendChild(label);
+  });
+  updateContentProgress(vid.currentTime || 0);
+}
+
+function updateContentProgress(time) {
+  const duration = Number(manifest?.duration || vid.duration || 0);
+  if (!contentProgress.classList.contains('visible') || !duration) return;
+  const bounded = Math.max(0, Math.min(duration, time || 0));
+  contentProgressFill.style.width = `${bounded / duration * 100}%`;
+}
+
 // ── boot: 读 manifest → 建 tab → 加载默认语言 ───────────────────────────────
 async function init() {
   manifest = await (await fetch('/manifest')).json();
+  bilingualMode = Boolean(manifest.bilingual);
+  chapters = Array.isArray(manifest.chapters) ? manifest.chapters : [];
+  document.body.classList.toggle('bilingual-mode', bilingualMode);
   const langs = manifest.languages || [];
   buildTabs(langs);
   const src = langs.find(l => l.source) || langs[0];
   await switchLang(src.code);
+  setupContentProgress();
 }
 
 function buildTabs(langs) {
@@ -593,7 +739,7 @@ function buildTabs(langs) {
 async function switchLang(code) {
   currentLang = code;
   const L = (manifest.languages || []).find(l => l.code === code) || {};
-  const data = await (await fetch('/api/transcript?lang=' + encodeURIComponent(code))).json();
+  const data = await (await fetch('/api/transcript?lang=' + encodeURIComponent(code), {cache: 'no-store'})).json();
   segments = (data.segments || []).map(s => Object.assign({}, s, { _id: Math.random().toString(36).slice(2) }));
   deletedIds = new Set();
   editMode = null;
@@ -641,11 +787,9 @@ function syncCurSub(doScroll) {
     }
   }
   if (active) {
-    curSub.textContent = active.text.trim();
-    curSub.classList.add('visible');
+    renderCurrentSubtitle(active);
   } else {
-    curSub.textContent = '';
-    curSub.classList.remove('visible');
+    renderCurrentSubtitle(null);
   }
   document.querySelectorAll('.sub-item').forEach(el => {
     const isActive = active && el.dataset.id == active._id;
@@ -660,7 +804,9 @@ vid.addEventListener('timeupdate', () => {
     dubAudio.currentTime = vid.currentTime;
   }
   syncCurSub();
+  updateContentProgress(vid.currentTime);
 });
+vid.addEventListener('loadedmetadata', setupContentProgress);
 
 // ── render ──────────────────────────────────────────────────────────────────
 function render() {
@@ -693,48 +839,43 @@ function render() {
     const textWrap = document.createElement('div');
     textWrap.className = 'sub-text-wrap';
 
-    const textEl = document.createElement('div');
-    textEl.className = 'sub-text';
-    textEl.contentEditable = 'false';
-    // When needle active show highlights; otherwise plain text
-    if (currentNeedle) {
-      textEl.innerHTML = insertMarks(seg.text, currentNeedle);
-    } else {
-      textEl.textContent = seg.text;
-    }
-
-    // Click row → seek video (only when not editing this item)
-    textEl.addEventListener('mousedown', e => {
-      if (textEl.contentEditable === 'true') {
-        e.stopPropagation(); // don't seek while editing
-      }
+    const textElements = segmentFields().map(field => {
+      const textEl = document.createElement('div');
+      textEl.className = `sub-text sub-text-${field}`;
+      textEl.dataset.field = field;
+      textEl.contentEditable = 'false';
+      const fieldText = seg[field] || '';
+      if (currentNeedle) textEl.innerHTML = insertMarks(fieldText, currentNeedle);
+      else textEl.textContent = fieldText;
+      textEl.addEventListener('mousedown', e => {
+        if (textEl.contentEditable === 'true') e.stopPropagation();
+      });
+      textEl.addEventListener('dblclick', e => {
+        e.stopPropagation();
+        startEdit(id, textEl, field);
+      });
+      textEl.addEventListener('blur', () => {
+        if (textEl.contentEditable === 'true') {
+          finishEdit(id, field, textEl.innerText.trim());
+          textEl.contentEditable = 'false';
+          if (currentNeedle) textEl.innerHTML = insertMarks(seg[field] || '', currentNeedle);
+          else textEl.textContent = seg[field] || '';
+        }
+      });
+      textEl.addEventListener('keydown', e => {
+        if (e.key === 'Escape') {
+          textEl.contentEditable = 'false';
+          textEl.textContent = seg[field] || '';
+          editMode = null;
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          textEl.blur();
+        }
+      });
+      textWrap.appendChild(textEl);
+      return textEl;
     });
-    textEl.addEventListener('dblclick', e => {
-      e.stopPropagation();
-      startEdit(id, textEl);
-    });
-    textEl.addEventListener('blur', () => {
-      if (textEl.contentEditable === 'true') {
-        finishEdit(id, textEl.innerText.trim());
-        textEl.contentEditable = 'false';
-        // Restore highlights if needle still active
-        if (currentNeedle) textEl.innerHTML = insertMarks(seg.text, currentNeedle);
-        else textEl.textContent = seg.text;
-      }
-    });
-    textEl.addEventListener('keydown', e => {
-      if (e.key === 'Escape') {
-        textEl.contentEditable = 'false';
-        textEl.textContent = seg.text;
-        editMode = null;
-      }
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        textEl.blur();
-      }
-    });
-
-    textWrap.appendChild(textEl);
 
     // Action buttons
     const actions = document.createElement('div');
@@ -743,7 +884,7 @@ function render() {
     editBtn.className = 'icon-btn';
     editBtn.textContent = '✎';
     editBtn.title = '编辑';
-    editBtn.addEventListener('click', e => { e.stopPropagation(); startEdit(id, textEl); });
+    editBtn.addEventListener('click', e => { e.stopPropagation(); startEdit(id, textElements[0], segmentFields()[0]); });
     const delBtn = document.createElement('button');
     delBtn.className = 'icon-btn del';
     delBtn.textContent = '✕';
@@ -754,12 +895,13 @@ function render() {
 
     // Click row → seek video (only when text not in edit mode)
     item.addEventListener('click', e => {
-      const el = listEl.querySelector(`[data-id="${id}"] .sub-text`);
-      if (el && el.contentEditable === 'true') return;
+      const editing = [...listEl.querySelectorAll(`[data-id="${id}"] .sub-text`)]
+        .some(el => el.contentEditable === 'true');
+      if (editing) return;
       vid.currentTime = seg.start;
       // Immediately show this subtitle without waiting for timeupdate
-      curSub.textContent = seg.text.trim();
-      curSub.classList.add('visible');
+      renderCurrentSubtitle(seg);
+      updateContentProgress(seg.start);
     });
 
     item.appendChild(check);
@@ -770,12 +912,12 @@ function render() {
   });
 }
 
-function startEdit(id, textEl) {
+function startEdit(id, textEl, field = 'text') {
   editMode = id;
   textEl.contentEditable = 'true';
   textEl.innerHTML = '';
   const seg = segments.find(s => s._id === id);
-  if (seg) textEl.textContent = seg.text;
+  if (seg) textEl.textContent = seg[field] || '';
   textEl.focus();
   // Move cursor to end
   const range = document.createRange();
@@ -786,9 +928,9 @@ function startEdit(id, textEl) {
   sel.addRange(range);
 }
 
-function finishEdit(id, value) {
+function finishEdit(id, field, value) {
   const seg = segments.find(s => s._id === id);
-  if (seg) seg.text = value;
+  if (seg) seg[field] = value;
   editMode = null;
   saveLS();
 }
@@ -830,7 +972,7 @@ function doFind(replaceVal, replaceOne) {
 
   for (let i = 0; i < visible.length; i++) {
     const idx = (startIdx + i) % visible.length;
-    if (re.test(visible[idx].text)) {
+    if (re.test(segmentSearchText(visible[idx]))) {
       findIndex = idx;
       const el = listEl.querySelector(`[data-id="${visible[idx]._id}"]`);
       if (el) {
@@ -841,7 +983,8 @@ function doFind(replaceVal, replaceOne) {
       if (replaceOne) {
         const seg = segments.find(s => s._id === visible[idx]._id);
         if (seg) {
-          seg.text = seg.text.replace(new RegExp(escapeRe(needle), 'gi'), replaceVal);
+          const field = segmentFields().find(name => re.test(seg[name] || ''));
+          if (field) seg[field] = (seg[field] || '').replace(new RegExp(escapeRe(needle), 'gi'), replaceVal);
           saveLS();
           render();
         }
@@ -849,8 +992,11 @@ function doFind(replaceVal, replaceOne) {
         let count = 0;
         segments.forEach(s => {
           if (deletedIds.has(s._id)) return;
-          const next = s.text.replace(new RegExp(escapeRe(needle), 'gi'), replaceVal);
-          if (next !== s.text) { s.text = next; count++; }
+          segmentFields().forEach(field => {
+            const before = s[field] || '';
+            const next = before.replace(new RegExp(escapeRe(needle), 'gi'), replaceVal);
+            if (next !== before) { s[field] = next; count++; }
+          });
         });
         statusTxt.textContent = `已替换 ${count} 处`;
         saveLS();
@@ -962,15 +1108,23 @@ def _lang_transcript_path(lang):
 
 @app.route("/")
 def index():
-    cache_key = f"subtitle_editor_v2:{VIDEO_PATH}:{TRANSCRIPT_PATH}"
+    # Include transcript mtime/size so a reused browser tab can never retain
+    # an older subtitle payload for the same exported video.
+    try:
+        st = os.stat(TRANSCRIPT_PATH)
+        cache_key = f"subtitle_editor_v3:{VIDEO_PATH}:{TRANSCRIPT_PATH}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        cache_key = f"subtitle_editor_v3:{VIDEO_PATH}:{TRANSCRIPT_PATH}"
     html = HTML_TEMPLATE.replace("__CACHE_KEY__", json.dumps(cache_key))
-    return Response(html, content_type="text/html; charset=utf-8")
+    return Response(html, content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
 
 
 @app.route("/manifest")
 def manifest():
     if MANIFEST:
-        return jsonify(MANIFEST)
+        response = jsonify(MANIFEST)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return response
     # 单语言:合成一个只有一种语言的 manifest,前端逻辑统一
     return jsonify({"video": "/video", "languages": [
         {"code": "src", "name": "字幕", "transcript": "src", "source": True}]})
@@ -1005,7 +1159,9 @@ def get_transcript():
     raw = _re.sub(r'\b-?Infinity\b', 'null', raw)
     data = json.loads(raw)
     segs = data.get("segments", data) if isinstance(data, dict) else data
-    return jsonify({"segments": segs})
+    response = jsonify({"segments": segs})
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 
 @app.route("/api/transcript", methods=["POST"])
@@ -1034,6 +1190,17 @@ def main():
         # 多语言:manifest 模式
         WORKSPACE = os.path.dirname(a1)
         MANIFEST = json.load(open(a1, encoding="utf-8"))
+        chapters_file = MANIFEST.get("chapters_file")
+        if chapters_file:
+            chapters_path = os.path.join(WORKSPACE, chapters_file)
+            chapters_payload = json.load(open(chapters_path, encoding="utf-8"))
+            MANIFEST["chapters"] = chapters_payload.get("chapters", [])
+            MANIFEST["duration"] = chapters_payload.get(
+                "duration", MANIFEST.get("duration", 0)
+            )
+            MANIFEST["min_progress_duration"] = chapters_payload.get(
+                "min_progress_duration", MANIFEST.get("min_progress_duration", 180)
+            )
         VIDEO_PATH = os.path.join(WORKSPACE, MANIFEST["video"])
         src = next((L for L in MANIFEST["languages"] if L.get("source")), MANIFEST["languages"][0])
         TRANSCRIPT_PATH = os.path.join(WORKSPACE, src["transcript"])

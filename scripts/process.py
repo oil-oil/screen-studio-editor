@@ -2,14 +2,17 @@
 """
 Screen Studio Auto-Editor
 Removes pauses and repeated narration from a .screenstudio project and
-normalizes the canvas/camera layout. Captions are intentionally NOT enabled
+optionally applies configured canvas/camera defaults. Captions are intentionally NOT enabled
 here; burned subtitles are produced separately by burn_subtitles.py (Mode B).
 """
 
 import argparse
 import array
+from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -34,13 +37,131 @@ from editing_core import (
 )
 
 
+ANALYSIS_CACHE_VERSION = 1
+USER_CONFIG_FILE = Path(
+    os.environ.get(
+        "SCREEN_STUDIO_EDITOR_CONFIG",
+        str(Path.home() / ".config" / "screen-studio-editor" / "config.json"),
+    )
+).expanduser()
+
+
 def log(msg):
     print(f"[screen-studio-editor] {msg}", flush=True)
+
+
+def load_user_config() -> dict:
+    if not USER_CONFIG_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(USER_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid user config {USER_CONFIG_FILE}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"User config must be a JSON object: {USER_CONFIG_FILE}")
+    return payload
+
+
+def resolve_visual_defaults(args: argparse.Namespace) -> dict | None:
+    payload = load_user_config().get("visual_defaults") or {}
+    if not isinstance(payload, dict):
+        raise SystemExit(f"visual_defaults must be a JSON object: {USER_CONFIG_FILE}")
+    enabled = (
+        args.apply_visual_defaults
+        if args.apply_visual_defaults is not None
+        else bool(payload.get("enabled", False))
+    )
+    if not enabled:
+        return None
+    required = {
+        "output_aspect",
+        "background_padding_ratio",
+        "window_border_radius",
+        "camera_aspect_ratio",
+        "camera_size",
+        "camera_position",
+        "camera_position_point",
+        "improve_microphone_audio",
+    }
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise SystemExit(
+            f"visual_defaults is enabled but missing {', '.join(missing)} in {USER_CONFIG_FILE}"
+        )
+    aspect = payload["output_aspect"]
+    point = payload["camera_position_point"]
+    if not (
+        isinstance(aspect, list)
+        and len(aspect) == 2
+        and all(isinstance(value, int) and value > 0 for value in aspect)
+    ):
+        raise SystemExit("visual_defaults.output_aspect must be [positive_width, positive_height]")
+    if not isinstance(point, dict) or not {"x", "y"}.issubset(point):
+        raise SystemExit("visual_defaults.camera_position_point must contain x and y")
+    return payload
 
 
 def _file_sha256(path: Path) -> str:
     """Hash a file's bytes — used to detect external edits between runs."""
     return file_sha256(path)
+
+
+def analysis_cache_signature(
+    project_json_path: Path,
+    transcript_path: Path | None,
+    args: argparse.Namespace,
+) -> str | None:
+    """Fingerprint reusable local evidence without trusting stale media scans."""
+    if transcript_path is None or not transcript_path.exists():
+        return None
+    payload = {
+        "version": ANALYSIS_CACHE_VERSION,
+        "project_sha256": _file_sha256(project_json_path),
+        "transcript_sha256": _file_sha256(transcript_path),
+        "process_sha256": _file_sha256(Path(__file__)),
+        "pause_threshold_ms": float(args.pause_threshold),
+        "min_pause_ms": float(args.min_pause),
+        "pause_source": str(args.pause_source),
+        "silence_db": str(args.silence_db),
+        "silence_min_dur": float(args.silence_min_dur),
+        "vad_enabled": not bool(args.no_vad),
+        "screen_activity_protection": not bool(args.no_screen_activity_protection),
+        "visual_scan_enabled": not bool(args.no_visual_scan),
+        "visual_scan_fps": float(args.visual_scan_fps),
+        "visual_change_threshold": float(args.visual_change_threshold),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def load_reusable_analysis(
+    report_path: Path,
+    expected_signature: str | None,
+) -> dict | None:
+    """Load a baseline evidence cache only when every safety input still matches."""
+    if expected_signature is None or not report_path.exists():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    required = (
+        "silence_regions_ms",
+        "pauses_applied",
+        "pauses_protected_by_activity",
+        "input_activity_intervals_ms",
+        "visual_activity_intervals_ms",
+        "activity_intervals_ms",
+    )
+    if (
+        report.get("analysis_cache_signature") != expected_signature
+        or not report.get("dry_run")
+        or report.get("reviewed_cuts_applied")
+        or any(key not in report for key in required)
+    ):
+        return None
+    return report
 
 
 def backup_project(project_json_path: Path):
@@ -241,6 +362,35 @@ def detect_visual_activity_intervals(
         if found:
             log(f"🖥️  Protected {found} display-change event(s) in session {index}.")
     return merge_intervals(intervals, gap_ms=150.0)
+
+
+def collect_screen_activity_evidence(
+    project_dir: Path,
+    metadata: dict,
+    session_offsets: list[dict],
+    *,
+    visual_scan: bool,
+    visual_scan_fps: float,
+    visual_change_threshold: float,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Collect independent input and visual evidence in one background job."""
+    input_intervals = merge_intervals(
+        load_input_activity_intervals(project_dir, metadata, session_offsets),
+        gap_ms=120.0,
+    )
+    visual_intervals: list[tuple[float, float]] = []
+    if visual_scan:
+        visual_intervals = merge_intervals(
+            detect_visual_activity_intervals(
+                project_dir,
+                metadata,
+                session_offsets,
+                fps=visual_scan_fps,
+                scene_threshold=visual_change_threshold,
+            ),
+            gap_ms=120.0,
+        )
+    return input_intervals, visual_intervals
 
 
 def _probe_duration_ms(path: Path) -> float | None:
@@ -481,6 +631,19 @@ def refine_repeat_cut_boundaries(
     """
     if not cuts:
         return []
+    if all(cut.get("preserve_reviewed_boundaries") for cut in cuts):
+        return [
+            {
+                **cut,
+                "start_ms": float(cut["start_ms"]),
+                "end_ms": float(cut["end_ms"]),
+                "reviewed_start_ms": float(cut["start_ms"]),
+                "reviewed_end_ms": float(cut["end_ms"]),
+                "boundary_refined": False,
+                "boundary_policy": "preserved_full_video_authorized_range",
+            }
+            for cut in cuts
+        ]
     try:
         quiet = WaveformQuietPointFinder(audio_path)
     except Exception as exc:
@@ -495,6 +658,15 @@ def refine_repeat_cut_boundaries(
     for cut in cuts:
         start_ms = float(cut["start_ms"])
         end_ms = float(cut["end_ms"])
+        if cut.get("preserve_reviewed_boundaries"):
+            refined.append({
+                **cut,
+                "reviewed_start_ms": start_ms,
+                "reviewed_end_ms": end_ms,
+                "boundary_refined": False,
+                "boundary_policy": "preserved_full_video_authorized_range",
+            })
+            continue
         overlapping_indices = [
             index for index, word in enumerate(ordered_words)
             if float(word["end"]) * 1000.0 > start_ms
@@ -1500,8 +1672,8 @@ def run_incremental_repeat_cuts(
 def main():
     parser = argparse.ArgumentParser(description="Screen Studio Auto-Editor")
     parser.add_argument("--project", required=True, help="Path to .screenstudio directory")
-    parser.add_argument("--pause-threshold", type=float, default=800, help="Pause threshold in ms (default: 800)")
-    parser.add_argument("--min-pause", type=float, default=300, help="Minimum pause to keep in ms (default: 300)")
+    parser.add_argument("--pause-threshold", type=float, default=700, help="Pause threshold in ms (default: 700)")
+    parser.add_argument("--min-pause", type=float, default=180, help="Minimum pause to keep in ms (default: 180)")
     parser.add_argument("--pause-source", choices=["silence", "asr", "both"], default="silence",
                         help="How to find pause cuts. Default: measured silence. ASR is available as an opt-in fallback.")
     parser.add_argument("--silence-db", default="auto",
@@ -1529,6 +1701,14 @@ def main():
     parser.add_argument("--report-output", type=Path,
                         help="Optional audit report path. Normal runs default beside the project; dry runs default to /tmp.")
     parser.add_argument("--skip-transcribe", help="Path to existing transcript JSON to reuse")
+    parser.add_argument(
+        "--reuse-analysis-report",
+        type=Path,
+        help=(
+            "Reuse fingerprinted silence/activity evidence from a prior dry run. "
+            "A mismatch falls back to a complete analysis."
+        ),
+    )
     parser.add_argument("--language", default="zh",
                         help="ASR language code (default: zh). Use 'en' for English, 'None' to auto-detect.")
     parser.add_argument("--asr-backend", choices=["bailian", "local"], default="bailian",
@@ -1537,7 +1717,17 @@ def main():
                         help="Re-apply everything from the original backup even if project.json was "
                              "edited externally (e.g. in Screen Studio) since the last run, DISCARDING "
                              "those external edits.")
+    parser.add_argument(
+        "--apply-visual-defaults",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Apply visual_defaults from the user config. By default this follows "
+            "visual_defaults.enabled; use --no-apply-visual-defaults to preserve layout."
+        ),
+    )
     args = parser.parse_args()
+    visual_defaults = resolve_visual_defaults(args)
 
     project_dir = Path(args.project)
     if not project_dir.exists() or not project_dir.is_dir():
@@ -1556,10 +1746,24 @@ def main():
         if args.dry_run else project_dir / "autoedit-report.json"
     )
     dry_transcript_cache_path: Path | None = None
+    reusable_analysis: dict | None = None
 
     if not project_json_path.exists():
         log(f"❌ project.json not found: {project_json_path}")
         sys.exit(1)
+
+    if args.reuse_analysis_report:
+        reuse_transcript = Path(args.skip_transcribe) if args.skip_transcribe else None
+        expected_signature = analysis_cache_signature(
+            project_json_path, reuse_transcript, args
+        )
+        reusable_analysis = load_reusable_analysis(
+            args.reuse_analysis_report, expected_signature
+        )
+        if reusable_analysis is None:
+            log("⚠️  Reusable analysis did not match this project/transcript/settings; running a full scan.")
+        else:
+            log(f"♻️  Reusing fingerprinted local evidence from {args.reuse_analysis_report.name}.")
 
     # A dry run must not mutate the bundle merely by creating the backup.
     if not args.dry_run:
@@ -1633,6 +1837,32 @@ def main():
         # Merge audio
         merged_audio = tmp / "merged_mic.wav"
         session_offsets = merge_audio(project_dir, mic_sessions, merged_audio, tmp)
+
+        # ASR, silence/VAD analysis, and screen-activity scanning all consume
+        # immutable media and session metadata.  Start the two local scans now
+        # so their ffmpeg/CPU work overlaps the network-backed ASR request.
+        analysis_executor: ThreadPoolExecutor | None = None
+        silence_future: Future | None = None
+        activity_future: Future | None = None
+        if reusable_analysis is None:
+            analysis_executor = ThreadPoolExecutor(max_workers=2)
+            silence_future = analysis_executor.submit(
+                detect_silence_regions_by_session,
+                session_offsets,
+                args.silence_db,
+                args.silence_min_dur,
+                use_vad=not args.no_vad,
+            )
+            if not args.no_screen_activity_protection:
+                activity_future = analysis_executor.submit(
+                    collect_screen_activity_evidence,
+                    project_dir,
+                    metadata,
+                    session_offsets,
+                    visual_scan=not args.no_visual_scan,
+                    visual_scan_fps=args.visual_scan_fps,
+                    visual_change_threshold=args.visual_change_threshold,
+                )
 
         # Transcribe. The transcript improves the edit (cut labeling, wordless-slice
         # protection, repeat review) but silence-based pause cutting works without
@@ -1724,46 +1954,71 @@ def main():
                     log("💾 Saved edit transcript → transcript.edit.json + transcript.json "
                         "(SOURCE time, fillers preserved)")
 
-        # Calibrate silence separately per recording session. A global mean is
-        # distorted by long dead-air stretches and by gain changes after pause/
-        # resume; short-window p20/p80 energy estimates are substantially safer.
-        silence_regions, _silence_thresholds = detect_silence_regions_by_session(
-            session_offsets,
-            args.silence_db,
-            args.silence_min_dur,
-            use_vad=not args.no_vad,
-        )
-
-        pause_cut_lists = []
-        if args.pause_source in {"silence", "both"}:
-            pause_cut_lists.append(
-                detect_pauses_from_silence(
-                    silence_regions,
-                    args.pause_threshold,
-                    args.min_pause,
-                    segments,
-                )
+        precomputed_input_activity: list[tuple[float, float]] = []
+        precomputed_visual_activity: list[tuple[float, float]] = []
+        if reusable_analysis is not None:
+            silence_regions = [
+                (float(start) / 1000.0, float(end) / 1000.0)
+                for start, end in reusable_analysis["silence_regions_ms"]
+            ]
+            _silence_thresholds = list(
+                reusable_analysis.get("silence_thresholds_db") or []
             )
+            pauses = [dict(item) for item in reusable_analysis["pauses_applied"]]
+            precomputed_input_activity = [
+                (float(start), float(end))
+                for start, end in reusable_analysis["input_activity_intervals_ms"]
+            ]
+            precomputed_visual_activity = [
+                (float(start), float(end))
+                for start, end in reusable_analysis["visual_activity_intervals_ms"]
+            ]
+        else:
+            try:
+                if silence_future is None:
+                    raise RuntimeError("parallel silence analysis was not started")
+                silence_regions, _silence_thresholds = silence_future.result()
+                if activity_future is not None:
+                    (
+                        precomputed_input_activity,
+                        precomputed_visual_activity,
+                    ) = activity_future.result()
+            finally:
+                if analysis_executor is not None:
+                    analysis_executor.shutdown(wait=True)
 
-        if args.pause_source in {"asr", "both"}:
-            asr_pauses = detect_pauses_from_asr(segments, args.pause_threshold, args.min_pause)
-            # ASR-only cuts are still checked against real silence. If silence
-            # detection finds nothing, do not cut on ASR timing alone by default.
-            if silence_regions:
-                asr_pauses = filter_pauses_by_silence(asr_pauses, silence_regions)
-            elif args.pause_source == "asr":
-                log("⚠️  No silence regions detected; using ASR pauses because --pause-source asr was explicitly requested.")
-            else:
-                log("⚠️  No silence regions detected; skipping ASR pause fallback.")
-                asr_pauses = []
-            pause_cut_lists.append(asr_pauses)
+            pause_cut_lists = []
+            if args.pause_source in {"silence", "both"}:
+                pause_cut_lists.append(
+                    detect_pauses_from_silence(
+                        silence_regions,
+                        args.pause_threshold,
+                        args.min_pause,
+                        segments,
+                    )
+                )
 
-        pauses = merge_cut_lists(pause_cut_lists)
+            if args.pause_source in {"asr", "both"}:
+                asr_pauses = detect_pauses_from_asr(
+                    segments, args.pause_threshold, args.min_pause
+                )
+                # ASR-only cuts are still checked against real silence. If silence
+                # detection finds nothing, do not cut on ASR timing alone by default.
+                if silence_regions:
+                    asr_pauses = filter_pauses_by_silence(asr_pauses, silence_regions)
+                elif args.pause_source == "asr":
+                    log("⚠️  No silence regions detected; using ASR pauses because --pause-source asr was explicitly requested.")
+                else:
+                    log("⚠️  No silence regions detected; skipping ASR pause fallback.")
+                    asr_pauses = []
+                pause_cut_lists.append(asr_pauses)
 
-        # Safety net: silence thresholds can misjudge quiet speech, so never let
-        # a pause cut remove anything ASR recognized as a word. Repeat cuts are
-        # exempt — removing recognized speech is their entire purpose.
-        pauses = protect_words_from_cuts(pauses, flatten_words(segments))
+            pauses = merge_cut_lists(pause_cut_lists)
+
+            # Safety net: silence thresholds can misjudge quiet speech, so never let
+            # a pause cut remove anything ASR recognized as a word. Repeat cuts are
+            # exempt — removing recognized speech is their entire purpose.
+            pauses = protect_words_from_cuts(pauses, flatten_words(segments))
 
         # Load reviewed cuts with explicit coordinate-space/project validation,
         # then refine semantic ASR/model ranges to nearby waveform minima.
@@ -1789,34 +2044,29 @@ def main():
         activity_intervals: list[tuple[float, float]] = []
         input_activity_intervals: list[tuple[float, float]] = []
         visual_activity_intervals: list[tuple[float, float]] = []
-        protected_pauses: list[dict] = []
+        protected_pauses: list[dict] = (
+            [
+                dict(item)
+                for item in reusable_analysis["pauses_protected_by_activity"]
+            ]
+            if reusable_analysis is not None
+            else []
+        )
         protected_repeats: list[dict] = []
         visual_clearance_overrides: list[dict] = []
-        if not args.no_screen_activity_protection and (pauses or repeats):
-            input_activity_intervals = load_input_activity_intervals(
-                project_dir, metadata, session_offsets
-            )
-            if not args.no_visual_scan:
-                visual_activity_intervals = detect_visual_activity_intervals(
-                    project_dir,
-                    metadata,
-                    session_offsets,
-                    fps=args.visual_scan_fps,
-                    scene_threshold=args.visual_change_threshold,
-                )
-            input_activity_intervals = merge_intervals(
-                input_activity_intervals, gap_ms=120.0
-            )
-            visual_activity_intervals = merge_intervals(
-                visual_activity_intervals, gap_ms=120.0
-            )
+        if not args.no_screen_activity_protection:
+            input_activity_intervals = precomputed_input_activity
+            visual_activity_intervals = precomputed_visual_activity
             activity_intervals = merge_intervals(
                 input_activity_intervals + visual_activity_intervals, gap_ms=120.0
             )
-            pauses, protected_pauses = protect_cuts_with_activity(pauses, activity_intervals)
-            if protected_pauses:
-                log(f"🛡️  Kept {len(protected_pauses)} silent interval(s) containing screen activity.")
-            if not args.allow_active_repeat_cuts:
+            if reusable_analysis is None and pauses:
+                pauses, protected_pauses = protect_cuts_with_activity(
+                    pauses, activity_intervals
+                )
+                if protected_pauses:
+                    log(f"🛡️  Kept {len(protected_pauses)} silent interval(s) containing screen activity.")
+            if repeats and not args.allow_active_repeat_cuts:
                 repeats, protected_repeats, visual_clearance_overrides = (
                     protect_reviewed_cuts_with_activity(
                         repeats,
@@ -1875,29 +2125,50 @@ def main():
 
         # Update project
         project_data["json"]["scenes"][0]["slices"] = new_slices
-        project_data["json"]["config"]["backgroundPaddingRatio"] = 1.02  # 2% padding
-        project_data["json"]["config"]["windowBorderRadius"] = 25
-        project_data["json"]["config"]["defaultOutputAspectRatio"] = {"x": 4, "y": 3}  # 4:3 canvas
-        project_data["json"]["config"]["cameraAspectRatio"] = "square"   # 宽高一致（正方形）
-        project_data["json"]["config"]["cameraSize"] = 0.3
-        project_data["json"]["config"]["cameraPosition"] = "top-right"
-        project_data["json"]["config"]["cameraPositionPoint"] = {"x": 1, "y": 0}
-        project_data["json"]["config"].setdefault("defaultLayout", {})
-        project_data["json"]["config"]["defaultLayout"]["cameraSize"] = 0.3
-        project_data["json"]["config"]["defaultLayout"]["cameraPositionPoint"] = {"x": 1, "y": 0}
-        project_data["json"]["config"]["improveMicrophoneAudio"] = True  # 降噪 + 音量均一化
-        # Note: cameraRoundness is intentionally NOT set — keep Screen Studio's default roundness
+        if visual_defaults:
+            aspect_x, aspect_y = visual_defaults["output_aspect"]
+            camera_point = visual_defaults["camera_position_point"]
+            config = project_data["json"]["config"]
+            config["backgroundPaddingRatio"] = visual_defaults["background_padding_ratio"]
+            config["windowBorderRadius"] = visual_defaults["window_border_radius"]
+            config["defaultOutputAspectRatio"] = {"x": aspect_x, "y": aspect_y}
+            config["cameraAspectRatio"] = visual_defaults["camera_aspect_ratio"]
+            config["cameraSize"] = visual_defaults["camera_size"]
+            config["cameraPosition"] = visual_defaults["camera_position"]
+            config["cameraPositionPoint"] = camera_point
+            config.setdefault("defaultLayout", {})
+            config["defaultLayout"]["cameraSize"] = visual_defaults["camera_size"]
+            config["defaultLayout"]["cameraPositionPoint"] = camera_point
+            config["improveMicrophoneAudio"] = visual_defaults["improve_microphone_audio"]
 
+        analysis_transcript_path = dry_transcript_cache_path
+        if analysis_transcript_path is None and transcript_ok:
+            analysis_transcript_path = (
+                Path(args.skip_transcribe)
+                if args.skip_transcribe
+                else project_dir / "transcript.edit.json"
+            )
+        cache_signature = analysis_cache_signature(
+            project_json_path, analysis_transcript_path, args
+        )
         audit_report = {
             "schema_version": 1,
             "dry_run": args.dry_run,
             "project": str(project_dir),
             "project_sha256": _file_sha256(project_json_path),
+            "analysis_cache_version": ANALYSIS_CACHE_VERSION,
+            "analysis_cache_signature": cache_signature,
+            "analysis_reused": reusable_analysis is not None,
+            "analysis_parallelized": reusable_analysis is None,
             "pause_threshold_ms": args.pause_threshold,
             "min_pause_ms": args.min_pause,
             "vad_enabled": not args.no_vad,
             "screen_activity_protection": not args.no_screen_activity_protection,
             "silence_thresholds_db": _silence_thresholds,
+            "silence_regions_ms": [
+                [round(start * 1000.0, 3), round(end * 1000.0, 3)]
+                for start, end in silence_regions
+            ],
             "pauses_applied": pauses,
             "reviewed_cuts_applied": repeats,
             "pauses_protected_by_activity": protected_pauses,
@@ -1940,11 +2211,27 @@ def main():
         log(f"   New duration:      {new_duration/1000:.1f}s")
         saved_percent = saved_ms / original_duration * 100 if original_duration else 0.0
         log(f"   Time saved:        {saved_ms/1000:.1f}s ({saved_percent:.1f}%)")
-        log(f"   Output ratio:      4:3 ✓")
-        log(f"   Padding:           2% ✓")
-        log(f"   Rounded corners:   25 ✓")
-        log(f"   Camera size:       30% ✓")
-        log(f"   Camera position:   top-right ✓")
+        if visual_defaults:
+            aspect_x, aspect_y = visual_defaults["output_aspect"]
+            log(f"   Output ratio:      {aspect_x}:{aspect_y} ✓")
+            log(
+                "   Padding ratio:     "
+                f"{visual_defaults['background_padding_ratio']} ✓"
+            )
+            log(
+                "   Rounded corners:   "
+                f"{visual_defaults['window_border_radius']} ✓"
+            )
+            log(
+                "   Camera size:       "
+                f"{float(visual_defaults['camera_size']) * 100:.0f}% ✓"
+            )
+            log(
+                "   Camera position:   "
+                f"{visual_defaults['camera_position']} ✓"
+            )
+        else:
+            log("   Visual defaults:   preserved from project")
         if not transcript_ok:
             log("")
             log("⚠️  SILENCE-ONLY RUN: ASR was unavailable, so there is no transcript.json.")

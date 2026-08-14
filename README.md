@@ -14,6 +14,8 @@ A Claude Code skill for editing Screen Studio recordings and burning AI-correcte
 **Mode B — Subtitle burning for any .mp4**
 - Works with any video, not just Screen Studio exports
 - Transcribes audio with Bailian FunAudio ASR by default
+- Uses Chinese-only subtitles by default; bilingual subtitles are opt-in
+- Keeps the broad gray chapter bar for videos longer than three minutes in either subtitle mode
 - Launches a live preview editor in the browser so you can review and fix subtitles before burning
 - Handles iPhone portrait videos, AAC timestamp drift, and mixed CJK/Latin content
 
@@ -51,6 +53,23 @@ Once installed, just describe what you want to Claude Code in natural language:
 
 Claude will handle the rest — transcribing, editing the timeline, launching the subtitle preview, and burning the final video.
 
+The user config supports a persistent subtitle default:
+
+```json
+{
+  "subtitles": {
+    "mode": "zh",
+    "progress_min_duration_seconds": 180
+  }
+}
+```
+
+Supported values are `zh` and `bilingual`. Chinese is the portable fallback.
+An explicit request for English or bilingual subtitles overrides this setting
+for the current video only. The progress bar appears only when the video is
+strictly longer than the configured duration, so exactly 180 seconds stays
+bar-free.
+
 ## How subtitles work
 
 Editing and standalone subtitle burning use Bailian FunAudio ASR through `bl speech recognize` by default and convert the result into the same `transcript.json` shape used by the existing preview and burn scripts. Bailian speech recognition does not take a free-form prompt for style instructions, so `scripts/bailian_transcribe.py` removes standalone fillers such as `呃`, `嗯`, and `啊` after ASR while keeping the raw response available for debugging. The old local Whisper-family path remains available only when explicitly requested for comparison or emergency fallback. The Bailian path sends extracted audio to Bailian; the local path keeps audio on the machine.
@@ -70,7 +89,10 @@ The burn step uses the original word-level timestamps for timing, removes displa
 | `scripts/bailian_transcribe.py` | Transcribe local audio/video with Bailian ASR and convert it to transcript.json |
 | `scripts/local_transcribe.py` | Transcribe local audio with a local model and convert it to transcript.json as a fallback |
 | `scripts/process.py` | Edit .screenstudio timeline (remove pauses, apply cuts) |
-| `scripts/burn_subtitles.py` | Burn ASS subtitles onto a video with ffmpeg |
+| `scripts/prepare_subtitles.py` | 按配置准备默认中文字幕或显式双语字幕，并生成宽粒度章节 |
+| `scripts/burn_subtitles.py` | 用 FFmpeg 烧录默认中文字幕和可选章节进度条，并执行固定 10% 摄像头磨皮和提亮 |
+| `scripts/burn_bilingual_subtitles.py` | 仅在明确要求双语时烧录中英字幕和可选章节进度条 |
+| `scripts/detect_face_regions.swift` | 用 macOS Vision 抽帧识别位置不限的稳定摄像头人脸区域 |
 | `scripts/preview_editor.py` | Local HTTP server for the subtitle preview/edit UI |
 | `scripts/merge_projects.py` | Merge two .screenstudio projects |
 | `setup.sh` | One-time environment setup |

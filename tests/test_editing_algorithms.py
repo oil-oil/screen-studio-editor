@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import editing_core
 import benchmark_autoedit
+import build_review_proxy
 import gemini_edit_candidates as candidates
 import global_edit_planner
 import session_edit_planner
@@ -33,6 +34,33 @@ def word(text: str, start: float, end: float) -> dict:
 
 def segment(start: float, end: float, text: str, words: list[dict] | None = None) -> dict:
     return {"start": start, "end": end, "text": text, "words": words or []}
+
+
+class ReviewProxyTests(unittest.TestCase):
+    def test_frame_sampling_happens_before_scaling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            recording = project / "recording"
+            recording.mkdir()
+            (recording / "display.mp4").touch()
+            sessions = [{"outputFilename": "display.mp4", "durationMs": 1000}]
+            captured: list[str] = []
+
+            def capture(args, *, description):
+                captured.extend(args)
+
+            with mock.patch.object(build_review_proxy, "run_ffmpeg", capture):
+                build_review_proxy.build_video_proxy(
+                    project,
+                    sessions,
+                    project / "proxy.mp4",
+                    width=960,
+                    height=600,
+                    fps=6.0,
+                )
+
+            filters = captured[captured.index("-filter_complex") + 1]
+            self.assertLess(filters.index("fps=6"), filters.index("scale=960:600"))
 
 
 class TimelineContractTests(unittest.TestCase):
@@ -140,6 +168,106 @@ class TimelineContractTests(unittest.TestCase):
 
 
 class PauseSafetyTests(unittest.TestCase):
+    def analysis_args(self, **overrides):
+        values = {
+            "pause_threshold": 700,
+            "min_pause": 180,
+            "pause_source": "silence",
+            "silence_db": "auto",
+            "silence_min_dur": 0.3,
+            "no_vad": False,
+            "no_screen_activity_protection": False,
+            "no_visual_scan": False,
+            "visual_scan_fps": 2.5,
+            "visual_change_threshold": 0.012,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def test_reusable_analysis_requires_exact_transcript_and_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_json = root / "project.json"
+            transcript = root / "transcript.json"
+            report_path = root / "baseline.json"
+            project_json.write_text('{"project": 1}')
+            transcript.write_text('[{"text": "第一版"}]')
+            signature = process.analysis_cache_signature(
+                project_json, transcript, self.analysis_args()
+            )
+            report = {
+                "dry_run": True,
+                "analysis_cache_signature": signature,
+                "reviewed_cuts_applied": [],
+                "silence_regions_ms": [[100, 200]],
+                "pauses_applied": [],
+                "pauses_protected_by_activity": [],
+                "input_activity_intervals_ms": [],
+                "visual_activity_intervals_ms": [],
+                "activity_intervals_ms": [],
+            }
+            report_path.write_text(json.dumps(report))
+
+            self.assertEqual(
+                process.load_reusable_analysis(report_path, signature), report
+            )
+            transcript.write_text('[{"text": "第二版"}]')
+            changed_signature = process.analysis_cache_signature(
+                project_json, transcript, self.analysis_args()
+            )
+            self.assertIsNone(
+                process.load_reusable_analysis(report_path, changed_signature)
+            )
+
+    def test_reusable_analysis_rejects_report_with_reviewed_cuts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "baseline.json"
+            report_path.write_text(json.dumps({
+                "dry_run": True,
+                "analysis_cache_signature": "same",
+                "reviewed_cuts_applied": [{"start_ms": 1, "end_ms": 2}],
+                "silence_regions_ms": [],
+                "pauses_applied": [],
+                "pauses_protected_by_activity": [],
+                "input_activity_intervals_ms": [],
+                "visual_activity_intervals_ms": [],
+                "activity_intervals_ms": [],
+            }))
+
+            self.assertIsNone(
+                process.load_reusable_analysis(report_path, "same")
+            )
+
+    def test_smart_workflow_reuses_only_current_analysis_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            project_json = project / "project.json"
+            transcript = project / "transcript.json"
+            report = project / "baseline.json"
+            project_json.write_text('{"project": 1}')
+            transcript.write_text('[]')
+            signature = process.analysis_cache_signature(
+                project_json, transcript, self.analysis_args()
+            )
+            report.write_text(json.dumps({
+                "project_sha256": smart_edit_workflow.project_sha256(project),
+                "analysis_cache_signature": signature,
+            }))
+
+            self.assertTrue(
+                smart_edit_workflow.baseline_is_current(
+                    project, report, transcript
+                )
+            )
+            report.write_text(json.dumps({
+                "project_sha256": smart_edit_workflow.project_sha256(project),
+            }))
+            self.assertFalse(
+                smart_edit_workflow.baseline_is_current(
+                    project, report, transcript
+                )
+            )
+
     def test_input_activity_loader_maps_relative_click_time_to_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -226,6 +354,26 @@ class PauseSafetyTests(unittest.TestCase):
             self.assertGreater(result[0]["end_ms"], 1200)
             self.assertGreaterEqual(result[0]["start_ms"], 660)
             self.assertLessEqual(result[0]["end_ms"], 1240)
+
+    def test_full_video_authorized_pause_keeps_reviewed_boundaries(self):
+        result = process.refine_repeat_cut_boundaries(
+            [{
+                "start_ms": 1000,
+                "end_ms": 2500,
+                "preserve_reviewed_boundaries": True,
+                "screen_action": "redundant",
+            }],
+            [],
+            Path("/audio/does/not/need/to/exist.wav"),
+            [],
+        )
+
+        self.assertEqual((result[0]["start_ms"], result[0]["end_ms"]), (1000.0, 2500.0))
+        self.assertFalse(result[0]["boundary_refined"])
+        self.assertEqual(
+            result[0]["boundary_policy"],
+            "preserved_full_video_authorized_range",
+        )
 
     def test_abandoned_sentence_refinement_keeps_gap_to_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -716,6 +864,188 @@ class CandidateRecallTests(unittest.TestCase):
 
 
 class PreferenceArbiterTests(unittest.TestCase):
+    def test_current_model_neutral_planner_report_replaces_legacy_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "baseline-report.transcript.edit.json").write_text(
+                json.dumps({"segments": [
+                    {"start": 0.0, "end": 1.0, "text": "前文"},
+                    {"start": 5.0, "end": 6.0, "text": "后文"},
+                ]})
+            )
+            (project / "global-video-planner-v11.json").write_text(json.dumps({
+                "candidates": [{
+                    "start": 1.0,
+                    "end": 2.0,
+                    "planner_category": "abandoned_take",
+                    "removed_text": "当前模型候选",
+                    "kept_text": "干净版本",
+                }]
+            }))
+            (project / "global-video-planner-v10.json").write_text(
+                json.dumps({"candidates": [{
+                    "start": 3.0,
+                    "end": 4.0,
+                    "planner_category": "abandoned_take",
+                    "removed_text": "旧模型候选",
+                    "kept_text": "干净版本",
+                }]})
+            )
+
+            rows = preference_edit_arbiter.candidate_rows(project)
+
+            self.assertEqual([row["removed_text"] for row in rows], ["当前模型候选"])
+            self.assertEqual(rows[0]["source_report"], "global-video-planner-v11.json")
+
+    def test_target_candidates_expose_timeline_and_sequence_relationships(self):
+        rows = [
+            {"id": "target_001", "start": 10.0, "end": 20.0},
+            {"id": "target_002", "start": 12.0, "end": 13.0},
+            {"id": "target_003", "start": 23.2, "end": 24.0},
+            {"id": "target_004", "start": 30.0, "end": 31.0},
+        ]
+
+        preference_edit_arbiter.annotate_candidate_relationships(rows)
+
+        self.assertEqual(rows[0]["sequence_group_id"], "sequence_001")
+        self.assertEqual(rows[2]["sequence_group_id"], "sequence_001")
+        self.assertEqual(rows[3]["sequence_group_id"], "sequence_002")
+        self.assertEqual(rows[0]["contains_target_ids"], ["target_002"])
+        self.assertEqual(rows[1]["contained_by_target_ids"], ["target_001"])
+        self.assertIn("target_002", rows[0]["overlapping_target_ids"])
+
+    def test_arbiter_prompt_grounds_targets_to_exact_video_timestamps(self):
+        target = {
+            "id": "target_001",
+            "start": 10.25,
+            "end": 12.75,
+            "start_ms": 10250,
+            "end_ms": 12750,
+            "planner_category": "abandoned_take",
+            "sequence_group_id": "sequence_001",
+            "related_target_ids": ["target_002"],
+            "overlapping_target_ids": ["target_002"],
+            "contained_by_target_ids": [],
+            "contains_target_ids": ["target_002"],
+            "removed_text": "失败的一遍",
+            "kept_text": "干净的一遍",
+        }
+
+        prompt = preference_edit_arbiter.prompt_for_arbitration(
+            [], [target], video_supplied=True
+        )
+
+        self.assertIn('"start_ms": 10250', prompt)
+        self.assertIn('"end_ms": 12750', prompt)
+        self.assertIn('"contains_target_ids": ["target_002"]', prompt)
+        self.assertIn("exact source-timeline start_ms/end_ms", prompt)
+        self.assertIn("belongs only to a failed/abandoned attempt", prompt)
+
+    def test_broad_cut_is_blocked_when_contained_target_is_not_cleared(self):
+        candidate = {"contains_target_ids": ["target_002"]}
+        decisions = {
+            "target_002": {
+                "decision": "keep",
+                "confidence": "high",
+                "screen_action": "meaningful",
+            }
+        }
+
+        self.assertEqual(
+            preference_edit_arbiter.relationship_safety_blocker(
+                candidate, decisions, {}
+            ),
+            "contained_target_not_cleared",
+        )
+        decisions["target_002"].update({
+            "decision": "cut",
+            "confidence": "high",
+        })
+        self.assertIsNone(
+            preference_edit_arbiter.relationship_safety_blocker(
+                candidate, decisions, {}
+            )
+        )
+
+    def test_multi_pause_showcase_cluster_requires_manual_review(self):
+        candidates = {
+            "target_001": {
+                "id": "target_001",
+                "planner_category": "screen_pause",
+                "related_target_ids": ["target_002", "target_003"],
+            },
+            "target_002": {
+                "id": "target_002",
+                "planner_category": "screen_pause",
+                "related_target_ids": ["target_001", "target_003"],
+            },
+            "target_003": {
+                "id": "target_003",
+                "planner_category": "screen_pause",
+                "related_target_ids": ["target_001", "target_002"],
+            },
+        }
+        decisions = {
+            target_id: {"decision": "cut", "confidence": "high"}
+            for target_id in candidates
+        }
+
+        self.assertEqual(
+            preference_edit_arbiter.relationship_safety_blocker(
+                candidates["target_001"], decisions, candidates
+            ),
+            "multi_pause_sequence_requires_manual_review",
+        )
+
+    def test_screen_pause_requires_safe_structured_sequence_role(self):
+        candidate = {
+            "planner_category": "screen_pause",
+            "video_review_supplied": True,
+            "screen_action": "redundant",
+            "visual_assessment": "The page scrolls through generated examples.",
+            "sequence_role": "invited_showcase",
+        }
+
+        self.assertEqual(
+            preference_edit_arbiter.automatic_safety_blocker(candidate),
+            "unsafe_screen_sequence_role",
+        )
+        candidate["sequence_role"] = "setup_navigation"
+        self.assertIsNone(
+            preference_edit_arbiter.automatic_safety_blocker(candidate)
+        )
+
+    def test_global_planner_requests_complete_failed_take_alternatives(self):
+        prompt = global_edit_planner.build_prompt(
+            [{"id": "U0001", "start": 1.0, "end": 2.0, "text": "失败的一遍"}],
+            video_supplied=True,
+        )
+
+        self.assertIn("complete disposable attempt", prompt)
+        self.assertIn("broader complete-attempt alternative", prompt)
+
+    def test_editorial_planner_requests_bounded_content_compression_candidates(self):
+        prompt = global_edit_planner.build_prompt(
+            [{"id": "U0001", "start": 1.0, "end": 2.0, "text": "可选补充"}],
+            video_supplied=True,
+            creator_cut_examples=[{
+                "removed_text": "另一条视频中被手动删除的完整补充",
+                "before": "核心观点",
+                "after": "下一点",
+            }],
+        )
+
+        self.assertIn("recording mistake", prompt)
+        self.assertNotIn("content_compression", prompt)
+
+        editorial_prompt = global_edit_planner.build_editorial_prompt(
+            [{"id": "U0001", "start": 1.0, "end": 4.0, "text": "可选补充"}],
+            creator_cut_examples=[{"removed_text": "手动删除的旁支"}],
+        )
+        self.assertIn("exactly ONE job", editorial_prompt)
+        self.assertIn("Find 5-20", editorial_prompt)
+        self.assertIn("手动删除的旁支", editorial_prompt)
+
     def test_arbiter_retries_one_empty_structured_response(self):
         responses = [
             {"choices": [{"message": {"content": ""}}]},
@@ -785,7 +1115,7 @@ class PreferenceArbiterTests(unittest.TestCase):
                 {"id": "S02", "start": 2.5, "end": 6.5},
             ])
 
-    def test_preference_arbiter_loads_long_session_hypothesis(self):
+    def test_default_preference_arbiter_ignores_session_boundary_hypothesis(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             (project / "baseline-report.transcript.edit.json").write_text(
@@ -805,8 +1135,7 @@ class PreferenceArbiterTests(unittest.TestCase):
 
             rows = preference_edit_arbiter.candidate_rows(project)
 
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["duration_ms"], 180_000)
+            self.assertEqual(rows, [])
 
     def test_short_speech_needs_structural_replacement_before_auto_cut(self):
         unrelated = {
@@ -849,6 +1178,7 @@ class PreferenceArbiterTests(unittest.TestCase):
         candidate.update({
             "screen_action": "none",
             "visual_assessment": "The page is static with no unique action or result.",
+            "sequence_role": "dead_air",
         })
         self.assertIsNone(
             preference_edit_arbiter.automatic_safety_blocker(candidate)
@@ -985,7 +1315,7 @@ class PreferenceArbiterTests(unittest.TestCase):
                 smart_edit_workflow.final_audit_is_current(report, "changed")
             )
 
-    def test_default_reviews_screen_active_pauses_from_two_seconds(self):
+    def test_default_reviews_every_measured_screen_active_pause(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
             (project / "baseline-report.transcript.edit.json").write_text(
@@ -1003,10 +1333,300 @@ class PreferenceArbiterTests(unittest.TestCase):
 
             rows = preference_edit_arbiter.candidate_rows(project)
 
-            self.assertEqual(preference_edit_arbiter.PROTECTED_PAUSE_MIN_MS, 2_000.0)
+            self.assertEqual(preference_edit_arbiter.PROTECTED_PAUSE_MIN_MS, 0.0)
             self.assertEqual([(row["start_ms"], row["end_ms"]) for row in rows], [
+                (1200, 3000),
                 (3200, 5700),
             ])
+
+    def test_adjacent_pause_fragments_with_same_context_are_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "baseline-report.transcript.edit.json").write_text(
+                json.dumps({"segments": [
+                    {"start": 0.0, "end": 1.0, "text": "讲完了。"},
+                    {"start": 5.0, "end": 6.0, "text": "这里继续"},
+                ]})
+            )
+            (project / "baseline-report.json").write_text(json.dumps({
+                "pauses_protected_by_activity": [
+                    {
+                        "start_ms": 1200,
+                        "end_ms": 2100,
+                        "duration_ms": 900,
+                        "text_before": "了。",
+                        "text_after": "这里",
+                    },
+                    {
+                        "start_ms": 2800,
+                        "end_ms": 4700,
+                        "duration_ms": 1900,
+                        "text_before": "了。",
+                        "text_after": "这里",
+                    },
+                ]
+            }))
+
+            rows = preference_edit_arbiter.candidate_rows(project)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["start_ms"], rows[0]["end_ms"]), (1200, 4700))
+            self.assertEqual(rows[0]["merged_pause_fragments"], 2)
+
+    def test_short_transition_candidate_is_word_agnostic_and_video_reviewed(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
+            {"id": "U0002", "start": 2.7, "end": 3.0, "text": "好。"},
+            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
+        ]
+
+        rows = preference_edit_arbiter.short_transition_candidates(atoms)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["start_ms"] if "start_ms" in rows[0] else round(rows[0]["start"] * 1000), 2220)
+        self.assertEqual(round(rows[0]["end"] * 1000), 4200)
+        self.assertEqual(rows[0]["removed_text"], "好。")
+        self.assertTrue(rows[0]["replacementless_local_cleanup"])
+
+    def test_short_content_unit_without_punctuation_is_not_transition_candidate(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
+            {"id": "U0002", "start": 2.7, "end": 3.0, "text": "重点"},
+            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
+        ]
+
+        self.assertEqual(
+            preference_edit_arbiter.short_transition_candidates(atoms),
+            [],
+        )
+
+    def test_semantic_four_character_phrase_is_not_transition_candidate(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
+            {"id": "U0002", "start": 2.7, "end": 3.2, "text": "直到现在，"},
+            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
+        ]
+
+        self.assertEqual(
+            preference_edit_arbiter.short_transition_candidates(atoms),
+            [],
+        )
+
+    def test_dangling_delivery_tail_becomes_full_video_candidate(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "完整前句，"},
+            {"id": "U0002", "start": 2.3, "end": 3.1, "text": "然后再"},
+            {"id": "U0003", "start": 3.8, "end": 5.0, "text": "重新说清楚。"},
+        ]
+
+        rows = preference_edit_arbiter.dangling_delivery_candidates(atoms)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (round(rows[0]["start"] * 1000), round(rows[0]["end"] * 1000)),
+            (2300, 3800),
+        )
+        self.assertEqual(rows[0]["removed_text"], "然后再")
+        self.assertTrue(rows[0]["replacementless_local_cleanup"])
+
+    def test_word_level_restarts_become_full_video_hypotheses(self):
+        segments = [{
+            "start": 1.0,
+            "end": 5.0,
+            "text": "看到vibe，不知道呃不知道。",
+            "words": [
+                word("看到", 1.0, 1.4),
+                word("v", 1.4, 1.5),
+                word("ibe", 1.5, 1.8),
+                word("vibe，", 1.8, 2.2),
+                word("不知道", 2.5, 3.0),
+                word("呃，", 3.0, 3.3),
+                word("不知道。", 3.4, 4.0),
+            ],
+        }]
+
+        rows = preference_edit_arbiter.repeated_delivery_candidates(segments)
+
+        self.assertTrue(any(
+            row["repair_evidence"] == "split_word_restart"
+            and row["removed_text"] == "vibe"
+            for row in rows
+        ))
+        self.assertTrue(any(
+            row["repair_evidence"] == "nearby_restart"
+            and "不知道" in row["removed_text"]
+            for row in rows
+        ))
+        self.assertTrue(all(row["refine_speech_boundaries"] for row in rows))
+
+    def test_word_level_restart_detector_ignores_repeated_numbers(self):
+        segments = [{
+            "start": 1.0,
+            "end": 2.0,
+            "text": "0 0 1",
+            "words": [
+                word("0", 1.0, 1.2),
+                word("0", 1.2, 1.4),
+                word("1", 1.4, 1.6),
+            ],
+        }]
+
+        self.assertEqual(
+            preference_edit_arbiter.repeated_delivery_candidates(segments),
+            [],
+        )
+
+    def test_global_planner_allows_grounded_short_delivery_cleanup(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "前半句"},
+            {"id": "U0002", "start": 2.2, "end": 3.0, "text": "然后再"},
+            {"id": "U0003", "start": 3.6, "end": 5.0, "text": "最终完成。"},
+        ]
+        plan = {"edits": [{
+            "remove_start_id": "U0002",
+            "remove_end_id": "U0002",
+            "cut_until_id": "U0003",
+            "replacement_ids": [],
+            "removed_quote": "然后再",
+            "replacement_quote": "",
+            "category": "delivery_cleanup",
+            "confidence": "high",
+            "reason": "A dangling delivery fragment before the sentence resumes.",
+        }]}
+
+        planned, rejected = global_edit_planner.candidates_from_plan(
+            plan, atoms, model="test", max_candidate_ms=90_000
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(planned), 1)
+        self.assertTrue(planned[0]["replacementless_local_cleanup"])
+        self.assertEqual(planned[0]["end_ms"], 3600)
+
+    def test_global_planner_allows_bounded_content_compression_for_review(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "核心观点。"},
+            {"id": "U0002", "start": 2.2, "end": 5.0, "text": "这里补充个人经历，"},
+            {"id": "U0003", "start": 5.0, "end": 8.0, "text": "它不影响核心结论。"},
+            {"id": "U0004", "start": 8.2, "end": 10.0, "text": "继续下一点。"},
+        ]
+        plan = {"edits": [{
+            "remove_start_id": "U0002",
+            "remove_end_id": "U0003",
+            "cut_until_id": "U0004",
+            "replacement_ids": [],
+            "removed_quote": "个人经历",
+            "replacement_quote": "",
+            "category": "content_compression",
+            "confidence": "medium",
+            "reason": "Optional aside; all unique tutorial claims remain outside it.",
+        }]}
+
+        planned, rejected = global_edit_planner.candidates_from_plan(
+            plan, atoms, model="test", max_candidate_ms=90_000
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(planned), 1)
+        self.assertTrue(planned[0]["replacementless_content_compression"])
+        self.assertFalse(planned[0]["replacementless_local_cleanup"])
+        self.assertEqual(planned[0]["end_ms"], 8200)
+
+    def test_transcript_atoms_split_short_soft_punctuation_transition(self):
+        atoms = global_edit_planner.transcript_atoms([{
+            "start": 1.0,
+            "end": 2.0,
+            "text": "好，我继续讲",
+            "words": [
+                {"word": "好，", "start": 1.0, "end": 1.2},
+                {"word": "我", "start": 1.24, "end": 1.4},
+                {"word": "继续讲", "start": 1.4, "end": 2.0},
+            ],
+        }])
+
+        self.assertEqual([item["text"] for item in atoms], ["好，", "我继续讲"])
+
+    def test_global_planner_allows_model_reviewed_short_transition_cleanup(self):
+        atoms = [
+            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
+            {"id": "U0002", "start": 2.7, "end": 3.0, "text": "好。"},
+            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
+        ]
+        plan = {"edits": [{
+            "remove_start_id": "U0002",
+            "remove_end_id": "U0002",
+            "cut_until_id": "U0003",
+            "replacement_ids": [],
+            "removed_quote": "好",
+            "replacement_quote": "",
+            "category": "delivery_cleanup",
+            "confidence": "high",
+            "reason": "A claim-free transition acknowledgment inside a long pause.",
+        }]}
+
+        planned, rejected = global_edit_planner.candidates_from_plan(
+            plan, atoms, model="test", max_candidate_ms=90_000
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["start_ms"], 2220)
+        self.assertEqual(planned[0]["spoken_start_ms"], 2700)
+        self.assertEqual(planned[0]["end_ms"], 4200)
+        self.assertTrue(planned[0]["short_transition_cleanup"])
+        self.assertTrue(planned[0]["replacementless_local_cleanup"])
+
+    def test_global_planner_preserves_complete_clause_before_dangling_tail(self):
+        atoms = [
+            {
+                "id": "U0001",
+                "start": 1.0,
+                "end": 2.4,
+                "text": "它也是通过写代码的方式，",
+            },
+            {"id": "U0002", "start": 2.7, "end": 3.5, "text": "然后再"},
+            {"id": "U0003", "start": 4.1, "end": 5.5, "text": "最终渲染出来。"},
+        ]
+        plan = {"edits": [{
+            "remove_start_id": "U0001",
+            "remove_end_id": "U0002",
+            "cut_until_id": "U0003",
+            "replacement_ids": [],
+            "removed_quote": "它也是通过写代码的方式，然后再",
+            "replacement_quote": "",
+            "category": "delivery_cleanup",
+            "confidence": "high",
+            "reason": "The trailing connector is a dangling delivery fragment.",
+        }]}
+
+        planned, rejected = global_edit_planner.candidates_from_plan(
+            plan, atoms, model="test", max_candidate_ms=90_000
+        )
+
+        self.assertEqual(rejected, [])
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["start_ms"], 2700)
+        self.assertEqual(planned[0]["end_ms"], 4100)
+        self.assertEqual(planned[0]["removed_text"], "然后再")
+        self.assertEqual(planned[0]["removed_quote"], "然后再")
+        self.assertTrue(planned[0]["replacementless_local_cleanup"])
+        self.assertTrue(planned[0]["planner_range_narrowed_to_tail"])
+
+    def test_video_review_can_clear_short_delivery_cleanup_without_replacement(self):
+        candidate = {
+            "start": 2.2,
+            "end": 3.6,
+            "duration_ms": 1400,
+            "planner_category": "delivery_cleanup",
+            "planner_confidence": "high",
+            "removed_text": "然后再",
+            "kept_text": "",
+            "replacementless_local_cleanup": True,
+            "video_review_supplied": True,
+        }
+        self.assertIsNone(
+            preference_edit_arbiter.automatic_safety_blocker(candidate)
+        )
 
     def test_smart_workflow_writes_source_time_cuts(self):
         document = smart_edit_workflow.cuts_document(
@@ -1023,6 +1643,29 @@ class PreferenceArbiterTests(unittest.TestCase):
         self.assertEqual(document["coordinate_space"], "source")
         self.assertEqual(document["project_sha256"], "abc")
         self.assertEqual(document["cuts"][0]["start_ms"], 1000)
+
+    def test_smart_workflow_preserves_full_video_local_cleanup_range(self):
+        cut = smart_edit_workflow.candidate_cut({
+            "start_ms": 1000,
+            "end_ms": 2200,
+            "planner_category": "delivery_cleanup",
+            "replacementless_local_cleanup": True,
+            "removed_text": "好。",
+        })
+
+        self.assertTrue(cut["preserve_reviewed_boundaries"])
+
+    def test_smart_workflow_refines_word_level_restart_boundaries(self):
+        cut = smart_edit_workflow.candidate_cut({
+            "start_ms": 1000,
+            "end_ms": 1600,
+            "planner_category": "delivery_cleanup",
+            "replacementless_local_cleanup": True,
+            "refine_speech_boundaries": True,
+            "removed_text": "设设",
+        })
+
+        self.assertNotIn("preserve_reviewed_boundaries", cut)
 
     def test_continuous_visual_without_input_is_not_auto_cut(self):
         blocker = preference_edit_arbiter.automatic_safety_blocker({
@@ -1048,7 +1691,7 @@ class PreferenceArbiterTests(unittest.TestCase):
                     {"start": 4.0, "end": 5.0, "text": "保留给观众看。"},
                 ]
             }))
-            (project / "global-video-planner-gemini35flash-v4.json").write_text(json.dumps({
+            (project / "global-video-planner-gemini35flash-v6.json").write_text(json.dumps({
                 "candidates": [
                     {"start": 1.0, "end": 2.0, "planner_category": "retake", "removed_text": "说错一遍"},
                     {"start": 3.0, "end": 4.0, "planner_category": "screen_pause", "removed_text": "[screen pause]"},
