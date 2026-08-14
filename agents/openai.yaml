@@ -1,4 +1,4 @@
 interface:
   display_name: "Screen Studio Editor"
-  short_description: "剪辑 Screen Studio 工程、校正字幕、合并项目并管理视频产物"
-  default_prompt: "使用 $screen-studio-editor，处理这个 Screen Studio 工程或导出视频。"
+  short_description: "剪辑、合并并整理 Screen Studio 工程时间线"
+  default_prompt: "使用 $screen-studio-editor，清理这个 Screen Studio 工程。"

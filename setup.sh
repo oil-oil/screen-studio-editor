@@ -37,13 +37,11 @@ if [[ ! -d ".venv" ]]; then
     python3 -m venv .venv
 fi
 .venv/bin/pip install --quiet --upgrade pip
-# flask powers the Mode B subtitle preview server; jieba is used for CJK
-# subtitle segmentation; silero-vad distinguishes speech from noisy pauses.
-# Keep these in sync with the imports in scripts/.
+# 本 Skill 只需要本地转录和 VAD；字幕依赖已拆到 oil-subtitle。
 if [[ "$(uname -m)" == "arm64" ]]; then
-    .venv/bin/pip install --quiet mlx-whisper jieba flask silero-vad
+    .venv/bin/pip install --quiet mlx-whisper silero-vad
 else
-    .venv/bin/pip install --quiet openai-whisper jieba flask silero-vad
+    .venv/bin/pip install --quiet openai-whisper silero-vad
 fi
 echo "      Python venv ready"
 
@@ -54,7 +52,7 @@ if [[ "$(uname -m)" == "arm64" ]]; then
 else
     "$SKILL_DIR/.venv/bin/python3" -c "import whisper; print('openai-whisper verified.')"
 fi
-"$SKILL_DIR/.venv/bin/python3" -c "import flask, jieba, silero_vad; print('flask + jieba + silero-vad verified.')"
+"$SKILL_DIR/.venv/bin/python3" -c "import silero_vad; print('silero-vad verified.')"
 
 echo ""
 echo "=== Setup complete ==="

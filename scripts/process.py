@@ -3,7 +3,7 @@
 Screen Studio Auto-Editor
 Removes pauses and repeated narration from a .screenstudio project and
 optionally applies configured canvas/camera defaults. Captions are intentionally NOT enabled
-here; burned subtitles are produced separately by burn_subtitles.py (Mode B).
+here; burned subtitles are produced separately by the oil-subtitle Skill.
 """
 
 import argparse

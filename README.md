@@ -1,102 +1,51 @@
 # screen-studio-editor
 
-A Claude Code skill for editing Screen Studio recordings and burning AI-corrected subtitles onto any video.
+用于剪辑和整理 Screen Studio `.screenstudio` 工程。
 
-## What it does
+## 能力
 
-**Mode A — Full .screenstudio editing**
-- Automatically removes awkward pauses from the recording timeline
-- Detects and cuts repeated narration / false starts (Claude reads the transcript and decides what to remove)
-- Enables noise reduction and volume normalization
-- Uses Bailian FunAudio ASR for the transcript by default
-- Burns accurate subtitles onto the exported video
+- 删除停顿、空片段、误讲和重复录制；
+- 使用声音、ASR、VAD、屏幕变化、输入事件和 Gemini 全片判断综合审查；
+- 学习创作者手工剪辑偏好并在应用前生成 dry-run 报告；
+- 合并补录工程；
+- 把纯口播工程的屏幕轨替换为按讲述对齐的 PPT。
 
-**Mode B — Subtitle burning for any .mp4**
-- Works with any video, not just Screen Studio exports
-- Transcribes audio with Bailian FunAudio ASR by default
-- Uses Chinese-only subtitles by default; bilingual subtitles are opt-in
-- Keeps the broad gray chapter bar for videos longer than three minutes in either subtitle mode
-- Launches a live preview editor in the browser so you can review and fix subtitles before burning
-- Handles iPhone portrait videos, AAC timestamp drift, and mixed CJK/Latin content
+导出视频的字幕已经拆到独立的 `oil-subtitle` Skill，本项目不再负责字幕预览和烧录。
 
-**Mode C — Merge two .screenstudio projects**
-- Merges a supplementary re-recording into an existing project
-- Supports inserting at a specific point in the timeline
+## 安装
 
-## Requirements
-
-- macOS
-- [Claude Code](https://claude.ai/code)
-- [Homebrew](https://brew.sh) (for ffmpeg)
-- Bailian CLI `bl` authenticated for the default ASR path
-- A local Whisper-family model cache only if you explicitly want old-model comparison or emergency fallback
-
-## Installation
-
-1. Install the skill into Claude Code:
-   ```
-   ~/.agents/skills/screen-studio-editor/
-   ```
-
-2. Run the one-time setup (installs ffmpeg, Python venv, local transcription dependencies, and Chinese phrase splitting):
-   ```bash
-   bash ~/.agents/skills/screen-studio-editor/setup.sh
-   ```
-
-## Usage
-
-Once installed, just describe what you want to Claude Code in natural language:
-
-- "帮我处理这个录屏 ~/Recordings/Tutorial.screenstudio"
-- "给这个视频加字幕 ~/Desktop/demo.mp4"
-- "把这两个工程合并 ProjectA.screenstudio ProjectB.screenstudio"
-
-Claude will handle the rest — transcribing, editing the timeline, launching the subtitle preview, and burning the final video.
-
-The user config supports a persistent subtitle default:
-
-```json
-{
-  "subtitles": {
-    "mode": "zh",
-    "progress_min_duration_seconds": 180
-  }
-}
+```bash
+bash /absolute/path/to/screen-studio-editor/setup.sh
 ```
 
-Supported values are `zh` and `bilingual`. Chinese is the portable fallback.
-An explicit request for English or bilingual subtitles overrides this setting
-for the current video only. The progress bar appears only when the video is
-strictly longer than the configured duration, so exactly 180 seconds stays
-bar-free.
+依赖 macOS、Python 3、FFmpeg、已登录的百炼 CLI `bl`，以及用于全片判断的模型 API 配置。
 
-## How subtitles work
+## 使用
 
-Editing and standalone subtitle burning use Bailian FunAudio ASR through `bl speech recognize` by default and convert the result into the same `transcript.json` shape used by the existing preview and burn scripts. Bailian speech recognition does not take a free-form prompt for style instructions, so `scripts/bailian_transcribe.py` removes standalone fillers such as `呃`, `嗯`, and `啊` after ASR while keeping the raw response available for debugging. The old local Whisper-family path remains available only when explicitly requested for comparison or emergency fallback. The Bailian path sends extracted audio to Bailian; the local path keeps audio on the machine.
+- `帮我剪这个工程 /path/Tutorial.screenstudio`
+- `只清理这个工程里的停顿`
+- `把补录工程合并到主工程末尾`
+- `把这个口播工程的屏幕换成配套 PPT`
 
-Before burning, a browser-based preview editor opens so you can:
-- Review all subtitles synced with video playback
-- Double-click to edit any line
-- Check/uncheck to delete lines
-- Find & replace across all subtitles
+默认质量入口：
 
-The burn step uses the original word-level timestamps for timing, removes display punctuation from final captions, and should be preceded by an agent line-by-line draft check for broken phrases, name corrections, and awkward subtitle boundaries.
+```bash
+.venv/bin/python3 scripts/smart_edit_workflow.py \
+  --project "/path/Tutorial.screenstudio"
+```
 
-## Scripts
+审查 `smart-edit-final-report.json` 后再增加 `--apply`。不要在质量入口前额外运行一次 `process.py --dry-run`，编排脚本内部已经完成基线分析。
 
-| Script | Purpose |
-|--------|---------|
-| `scripts/bailian_transcribe.py` | Transcribe local audio/video with Bailian ASR and convert it to transcript.json |
-| `scripts/local_transcribe.py` | Transcribe local audio with a local model and convert it to transcript.json as a fallback |
-| `scripts/process.py` | Edit .screenstudio timeline (remove pauses, apply cuts) |
-| `scripts/prepare_subtitles.py` | 按配置准备默认中文字幕或显式双语字幕，并生成宽粒度章节 |
-| `scripts/burn_subtitles.py` | 用 FFmpeg 烧录默认中文字幕和可选章节进度条，并执行固定 10% 摄像头磨皮和提亮 |
-| `scripts/burn_bilingual_subtitles.py` | 仅在明确要求双语时烧录中英字幕和可选章节进度条 |
-| `scripts/detect_face_regions.swift` | 用 macOS Vision 抽帧识别位置不限的稳定摄像头人脸区域 |
-| `scripts/preview_editor.py` | Local HTTP server for the subtitle preview/edit UI |
-| `scripts/merge_projects.py` | Merge two .screenstudio projects |
-| `setup.sh` | One-time environment setup |
+## 主要脚本
 
-## License
+| 脚本 | 作用 |
+|---|---|
+| `scripts/smart_edit_workflow.py` | 默认质量剪辑编排 |
+| `scripts/process.py` | 本地分析、停顿清理、cuts 校验和时间线写入 |
+| `scripts/global_edit_planner.py` | 全片语义候选 |
+| `scripts/preference_edit_arbiter.py` | 创作者偏好学习和候选仲裁 |
+| `scripts/build_review_proxy.py` | 构建源时间对齐的音画代理 |
+| `scripts/merge_projects.py` | 合并 Screen Studio 工程 |
+| `scripts/auto_ppt_replace.py` | 用按口播对齐的页面替换屏幕轨 |
 
-MIT
+完整流程见 [SKILL.md](SKILL.md)。

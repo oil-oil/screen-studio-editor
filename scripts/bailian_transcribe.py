@@ -205,7 +205,7 @@ def _apply_glossary(segments: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     """
     Apply recurring glossary corrections to segment display text after ASR.
 
-    burn_subtitles.py applies the same replacements at burn time, so doing it
+    oil-subtitle applies the same replacements at burn time, so doing it
     here does not change the final captions — it makes the corrections visible
     in the preview editor instead of silently appearing in the burned video,
     and lets the reviewing agent focus on new, unknown errors. Word-level

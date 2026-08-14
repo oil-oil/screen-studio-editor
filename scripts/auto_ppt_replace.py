@@ -9,7 +9,7 @@ Agent 负责前半段（转写、设计 deck、渲染页图、定翻页表和放
 用法:
   auto_ppt_replace.py \
     --project "/path/Xxx.screenstudio" \
-    --pages   "/path/rendered_pages"  \        # 内含 deck00.png .. deckNN.png（页 = index+1）
+    --pages   "/path/rendered_pages"           # 内含 deck00.png .. deckNN.png（页 = index+1）
     --plan    "/path/plan.json"                 # 翻页表 + 放大点 + 画幅，见下
 
 plan.json:
