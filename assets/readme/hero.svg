@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="380" viewBox="0 0 1200 380" role="img" aria-labelledby="title desc">
+  <title id="title">screen-studio-editor 清理 Screen Studio 工程时间线</title>
+  <desc id="desc">左侧是项目名称和用途，右侧是一条带删除区间的 Screen Studio 时间线：停顿被标出，确认后再写入工程。</desc>
+
+  <rect width="1200" height="380" rx="28" fill="#161412"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <text x="56" y="62" fill="#B7A99A" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="2">SCREEN STUDIO PROJECT</text>
+    <text x="52" y="128" fill="#F6F1EA" font-size="48" font-weight="760" letter-spacing="-1.5">screen-studio-editor</text>
+    <text x="56" y="176" fill="#E4D9CC" font-size="24" font-weight="560">清理录屏工程里的停顿、误讲和重复</text>
+    <text x="56" y="210" fill="#E4D9CC" font-size="24" font-weight="560">先出报告，确认后再写入时间线</text>
+
+    <g transform="translate(56 268)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" font-weight="650">
+      <circle cx="5" cy="-5" r="5" fill="#FF6A3D"/>
+      <text x="20" y="1" fill="#F0E7DC">DRY-RUN</text>
+      <path d="M118 -18V6" stroke="#4A433C"/>
+      <text x="136" y="1" fill="#F0E7DC">REVIEW</text>
+      <path d="M228 -18V6" stroke="#4A433C"/>
+      <text x="246" y="1" fill="#F0E7DC">APPLY</text>
+    </g>
+  </g>
+
+  <g id="timeline-proof" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <rect x="620" y="42" width="532" height="296" rx="20" fill="#221F1C"/>
+    <rect x="620" y="42" width="532" height="46" fill="#2B2723"/>
+    <circle cx="644" cy="65" r="6" fill="#E25B4A"/>
+    <circle cx="664" cy="65" r="6" fill="#E0B34A"/>
+    <circle cx="684" cy="65" r="6" fill="#5FBE73"/>
+    <text x="710" y="71" fill="#F0E7DC" font-size="18" font-weight="700">Project.screenstudio</text>
+
+    <text x="646" y="118" fill="#A89888" font-size="18">00:00</text>
+    <text x="1088" y="118" fill="#A89888" font-size="18" text-anchor="end">03:12</text>
+
+    <rect x="646" y="132" width="480" height="54" rx="8" fill="#2F2A26"/>
+    <rect x="646" y="146" width="118" height="26" rx="6" fill="#3F8CFF"/>
+    <rect x="776" y="146" width="52" height="26" rx="6" fill="#FF6A3D" opacity=".88"/>
+    <rect x="840" y="146" width="96" height="26" rx="6" fill="#3F8CFF"/>
+    <rect x="948" y="146" width="36" height="26" rx="6" fill="#FF6A3D" opacity=".88"/>
+    <rect x="996" y="146" width="130" height="26" rx="6" fill="#3F8CFF"/>
+
+    <g fill="#6F675F">
+      <rect x="658" y="204" width="6" height="18" rx="3"/>
+      <rect x="672" y="196" width="6" height="34" rx="3"/>
+      <rect x="686" y="190" width="6" height="46" rx="3"/>
+      <rect x="700" y="198" width="6" height="30" rx="3"/>
+      <rect x="714" y="192" width="6" height="42" rx="3"/>
+      <rect x="728" y="206" width="6" height="14" rx="3" fill="#FF6A3D"/>
+      <rect x="742" y="210" width="6" height="10" rx="3" fill="#FF6A3D"/>
+      <rect x="756" y="208" width="6" height="12" rx="3" fill="#FF6A3D"/>
+      <rect x="770" y="206" width="6" height="14" rx="3" fill="#FF6A3D"/>
+      <rect x="784" y="194" width="6" height="38" rx="3"/>
+      <rect x="798" y="188" width="6" height="50" rx="3"/>
+      <rect x="812" y="196" width="6" height="34" rx="3"/>
+      <rect x="826" y="192" width="6" height="42" rx="3"/>
+      <rect x="840" y="200" width="6" height="26" rx="3"/>
+      <rect x="854" y="190" width="6" height="46" rx="3"/>
+      <rect x="868" y="198" width="6" height="30" rx="3"/>
+      <rect x="882" y="194" width="6" height="38" rx="3"/>
+      <rect x="896" y="188" width="6" height="50" rx="3"/>
+      <rect x="910" y="202" width="6" height="22" rx="3"/>
+      <rect x="924" y="196" width="6" height="34" rx="3"/>
+      <rect x="938" y="210" width="6" height="10" rx="3" fill="#FF6A3D"/>
+      <rect x="952" y="212" width="6" height="8" rx="3" fill="#FF6A3D"/>
+      <rect x="966" y="208" width="6" height="12" rx="3" fill="#FF6A3D"/>
+      <rect x="980" y="194" width="6" height="38" rx="3"/>
+      <rect x="994" y="188" width="6" height="50" rx="3"/>
+      <rect x="1008" y="196" width="6" height="34" rx="3"/>
+      <rect x="1022" y="192" width="6" height="42" rx="3"/>
+      <rect x="1036" y="200" width="6" height="26" rx="3"/>
+      <rect x="1050" y="190" width="6" height="46" rx="3"/>
+      <rect x="1064" y="198" width="6" height="30" rx="3"/>
+      <rect x="1078" y="204" width="6" height="18" rx="3"/>
+    </g>
+
+    <rect x="646" y="248" width="480" height="64" rx="12" fill="#2F2A26"/>
+    <text x="886" y="274" fill="#F6F1EA" font-size="18" font-weight="650" text-anchor="middle">原始 3:12  →  预览 2:41</text>
+    <text x="886" y="298" fill="#C9B8A8" font-size="16" text-anchor="middle">删除 2 处停顿、1 处重复口播</text>
+  </g>
+</svg>

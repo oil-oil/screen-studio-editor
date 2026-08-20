@@ -5,3 +5,6 @@ __pycache__/
 .vocabulary-cache.json
 归档.zip
 glossary.json
+hotwords.json
+config.json
+creator-edit-preferences.json
