@@ -64,7 +64,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def api_key_from_args(args: argparse.Namespace) -> str:
-    key = args.api_key or os.environ.get("ZENMUX_API_KEY", "")
+    if getattr(args, "api_key", ""):
+        raise ValueError("明文 Key 参数已停用；请使用固定配置页或可信运行环境")
+    key = os.environ.get("ZENMUX_API_KEY", "")
     if not key and args.api_key_file.exists():
         key = args.api_key_file.read_text(encoding="utf-8").strip()
     if not key and not args.dry_run:

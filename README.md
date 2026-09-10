@@ -4,7 +4,7 @@
   <img src="./assets/readme/hero.svg" width="100%" alt="screen-studio-editor 清理 Screen Studio 工程时间线：先 dry-run 审查，再写入工程">
 </p>
 
-把 Screen Studio 的 `.screenstudio` 工程交给 Agent，删除停顿、误讲、重复录制和空片段。默认先出 dry-run 报告，确认后再写入时间线。导出成片后的字幕交给 [oil-subtitle](https://github.com/oil-oil/oil-subtitle)。
+剪辑录屏工程中的停顿、误讲、重复与空片段，支持合并补录和按讲述替换屏幕内容。
 
 [快速开始](#快速开始) · [四种用法](#四种用法) · [数据边界](#数据边界)
 
@@ -97,3 +97,9 @@ Agent 的完整执行规范见 [SKILL.md](SKILL.md)。
 ```bash
 ./.venv/bin/python3 -m unittest discover -s tests
 ```
+
+## API Key 配置页面
+
+质量剪辑需要转录与语义分析服务，可在同一固定页面填写两个 Key；仅转录只配置对应一项，本地工程合并不需要 Key。密钥进入系统凭据库，业务通过包装器按需读取。页面需要 Node.js 22.18+；模型和工具依赖仍按原流程准备。
+
+状态检查、页面启动、业务命令和恢复说明见[配置入口](references/api-key-setup.md)。已有凭据不重复填写，不将 Key 发进聊天，不自动删除旧配置。
