@@ -4,7 +4,7 @@
   <img src="./assets/readme/hero.svg" width="100%" alt="screen-studio-editor 清理 Screen Studio 工程时间线：先 dry-run 审查，再写入工程">
 </p>
 
-把 Screen Studio 的 `.screenstudio` 工程交给 Agent，删除停顿、误讲、重复录制和空片段。默认先出 dry-run 报告，确认后再写入时间线。导出成片后的字幕交给 [oil-subtitle](https://github.com/oil-oil/oil-subtitle)。
+剪辑录屏工程中的停顿、误讲、重复与空片段，支持合并补录和按讲述替换屏幕内容。
 
 [快速开始](#快速开始) · [四种用法](#四种用法) · [数据边界](#数据边界)
 
