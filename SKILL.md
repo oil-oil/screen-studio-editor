@@ -77,15 +77,6 @@ bash "$SKILL_DIR/setup.sh"
 
 ### 2. 运行默认质量工作流
 
-普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
-
-```bash
-"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
-  --project "/path/to/Project.screenstudio"
-```
-
-该命令默认不写时间线。它内部完成基线 ASR、静音/VAD、屏幕活动分析、对齐代理、Gemini 全片候选、创作者偏好仲裁、本地微剪和最终 dry-run，并复用仍然有效的缓存。
-
 质量模式需要 `creator_preferences`。如果尚未配置，先从独立 benchmark 工程构建：
 
 ```bash
@@ -95,6 +86,16 @@ bash "$SKILL_DIR/setup.sh"
 ```
 
 如果没有个人偏好样本，不要套用其他人的文件；改用下面的“仅清理停顿”。
+
+
+普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+  --project "/path/to/Project.screenstudio"
+```
+
+该命令默认不写时间线。它内部完成基线 ASR、静音/VAD、屏幕活动分析、对齐代理、Gemini 全片候选、创作者偏好仲裁、本地微剪和最终 dry-run，并复用仍然有效的缓存。
 
 ### 3. 审查结果
 
