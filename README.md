@@ -97,3 +97,9 @@ Agent 的完整执行规范见 [SKILL.md](SKILL.md)。
 ```bash
 ./.venv/bin/python3 -m unittest discover -s tests
 ```
+
+## API Key 配置页面
+
+质量剪辑需要转录与语义分析服务，可在同一固定页面填写两个 Key；仅转录只配置对应一项，本地工程合并不需要 Key。密钥进入系统凭据库，业务通过包装器按需读取。页面需要 Node.js 22.18+；模型和工具依赖仍按原流程准备。
+
+状态检查、页面启动、业务命令和恢复说明见[配置入口](references/api-key-setup.md)。已有凭据不重复填写，不将 Key 发进聊天，不自动删除旧配置。

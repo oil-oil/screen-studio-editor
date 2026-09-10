@@ -13,6 +13,10 @@ description: >
 
 脚本负责时间坐标、session 对齐、缓存、活动保护、波形边界和 `project.json` 写入。Agent 负责选择入口、审查候选、确认高风险删除并组织用户预览，不要手工重做脚本内部算法。
 
+## API Key 配置入口
+
+云端转录与语义剪辑前，先读[API Key 配置与业务读取](references/api-key-setup.md)。质量剪辑使用 default 同页配置转录与分析 Key；仅转录使用 transcription。已有安全配置直接复用，缺少时由用户亲自填写固定页面，不在聊天或命令参数中传 Key。
+
 ## 初始化
 
 ```bash
@@ -91,7 +95,7 @@ bash "$SKILL_DIR/setup.sh"
 普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
 
 ```bash
-"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio"
 ```
 
@@ -114,7 +118,7 @@ bash "$SKILL_DIR/setup.sh"
 确认安全后：
 
 ```bash
-"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio" \
   --apply
 ```
@@ -138,7 +142,7 @@ PROJECT="/path/to/Project.screenstudio"
 WORK="$PROJECT/.screen-studio-editor"
 mkdir -p "$WORK"
 
-"$PYTHON" "$SKILL_DIR/scripts/process.py" \
+node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "$PROJECT" \
   --pause-threshold 700 \
   --min-pause 180 \
@@ -152,7 +156,7 @@ mkdir -p "$WORK"
 审查报告后复用转录稿并应用：
 
 ```bash
-"$PYTHON" "$SKILL_DIR/scripts/process.py" \
+node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "$PROJECT" \
   --skip-transcribe "$WORK/autoedit-report.transcript.edit.json" \
   --pause-threshold 700 \

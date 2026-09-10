@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "screen-studio-editor",
+  "label": "语音转录 API Key",
+  "credential": "screen-studio-editor/dashscope/default",
+  "ui": {
+    "title": "配置剪辑服务",
+    "placeholder": "粘贴对应服务的 API Key",
+    "saveLabel": "保存"
+  }
+}

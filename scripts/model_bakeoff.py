@@ -60,7 +60,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def bailian_api_key(args: argparse.Namespace) -> str:
-    key = args.bailian_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
+    if getattr(args, "bailian_api_key", ""):
+        raise ValueError("明文 Key 参数已停用；请使用固定配置页或可信运行环境")
+    key = os.environ.get("DASHSCOPE_API_KEY", "")
     if key:
         return key
     try:

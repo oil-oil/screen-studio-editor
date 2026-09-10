@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "profiles": {
+    "default": [
+      {
+        "manifest": "transcription.json",
+        "env": "DASHSCOPE_API_KEY"
+      },
+      {
+        "manifest": "default.json",
+        "env": "ZENMUX_API_KEY"
+      }
+    ],
+    "transcription": [
+      {
+        "manifest": "transcription.json",
+        "env": "DASHSCOPE_API_KEY"
+      }
+    ],
+    "native": [
+      {
+        "manifest": "native.json",
+        "env": "GEMINI_API_KEY"
+      }
+    ],
+    "analysis": [
+      {
+        "manifest": "default.json",
+        "env": "ZENMUX_API_KEY"
+      }
+    ]
+  }
+}
