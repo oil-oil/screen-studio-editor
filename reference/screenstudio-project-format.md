@@ -12,7 +12,6 @@ Xxx.screenstudio/
 ├── project.json.bak          本 skill 首次运行时的备份
 ├── meta.json                 工程级元信息(缩略图、时长等)
 ├── recording-markers.json    录制打点
-├── .autoedit-state.json      自动剪辑状态
 ├── transcript.json           转写结果(经本 skill 处理后才有)
 └── recording/                原始录制素材(多通道)
     ├── metadata.json         录制元数据 —— 定义有哪些通道、每段录了多久

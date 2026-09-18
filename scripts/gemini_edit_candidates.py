@@ -35,8 +35,6 @@ from editing_core import build_cuts_document
 
 
 DEFAULT_API_BASE = "https://zenmux.ai/api/v1"
-DEFAULT_MODEL = "google/gemini-3.5-flash"
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_BAILIAN_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_BAILIAN_MODEL = "qwen3.5-omni-plus"
 DEFAULT_SEMANTIC_AUDIT_MODEL = "qwen3.7-plus"
@@ -93,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuts-output", type=Path, default=Path("/tmp/gemini_cuts.json"), help="process.py-compatible cuts JSON.")
     parser.add_argument("--work-dir", type=Path, default=Path("/tmp/gemini_edit_candidates"), help="Where extracted frames and request logs are written.")
     parser.add_argument("--api-base", default=DEFAULT_API_BASE)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", help="ZenMux 模型 ID；选择该后端时必须显式指定。")
     parser.add_argument("--api-key", default="", help="Optional API key. Prefer ZENMUX_API_KEY.")
     parser.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--max-candidates", type=int, default=60,
@@ -151,7 +149,7 @@ def parse_args() -> argparse.Namespace:
         help="Frame sampling rate for the visual-only semantic audit (default: 0.5).",
     )
     parser.add_argument("--gemini-api-key", default="", help="Optional direct Gemini key. Prefer GEMINI_API_KEY.")
-    parser.add_argument("--gemini-model", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--gemini-model", help="直连 Gemini 的模型 ID；选择该后端时必须显式指定。")
     parser.add_argument("--context-window", type=float, default=4.0, help="Seconds of transcript context on each side.")
     parser.add_argument("--frame-window", type=float, default=0.8, help="Seconds before/after candidate midpoint for frames.")
     parser.add_argument("--clip-context", type=float, default=1.5,
@@ -974,11 +972,9 @@ def tail_restart_candidates(
                 continue
             similarity, suffix, prefix = best
             start = float(suffix[0]["start"])
-            end = float(right_segment["start"])
-            intervening = usable[left_index + 1:right_index]
-            removed_text = "".join(word_text(item) for item in suffix) + "".join(
-                str(item.get("text") or "").strip() for item in intervening
-            )
+            # 只提出删除重复尾句；两次讲述之间的提醒、操作和结果独立保留。
+            end = float(suffix[-1]["end"])
+            removed_text = "".join(word_text(item) for item in suffix)
             raw.append({
                 "type": "possible_tail_restart",
                 "start": start,
@@ -1660,7 +1656,7 @@ def redact_payload(value: Any) -> Any:
     if isinstance(value, dict):
         result = {}
         for key, child in value.items():
-            if key == "url" and isinstance(child, str) and child.startswith("data:"):
+            if key in {"url", "file_data"} and isinstance(child, str) and child.startswith("data:"):
                 result[key] = child[:64] + "...[base64 omitted]"
             elif key == "data" and isinstance(child, str) and len(child) > 256:
                 result[key] = f"[base64 omitted: {len(child)} chars]"
@@ -1709,6 +1705,13 @@ def post_json(url: str, payload: dict[str, Any], api_key: str, timeout: int) -> 
         },
         method="POST",
     )
+    if payload.get("stream"):
+        response = read_urlopen_sse(request, timeout)
+        return {
+            "model": response.get("model"),
+            "choices": [{"message": {"content": response["text"]}}],
+            "usage": response.get("usage"),
+        }
     return read_urlopen_json(request, timeout)
 
 
@@ -1733,11 +1736,12 @@ def read_urlopen_sse(
     *,
     attempts: int = 3,
 ) -> dict[str, Any]:
-    """Read an OpenAI-compatible streaming response from Bailian."""
+    """Read an OpenAI-compatible streaming response."""
     last_error: BaseException | None = None
     for attempt in range(attempts):
         parts: list[str] = []
         usage: dict[str, Any] | None = None
+        model: str | None = None
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 for raw_line in response:
@@ -1748,6 +1752,8 @@ def read_urlopen_sse(
                     if data == "[DONE]":
                         break
                     event = json.loads(data)
+                    if event.get("model"):
+                        model = str(event["model"])
                     if isinstance(event.get("usage"), dict):
                         usage = event["usage"]
                     for choice in event.get("choices") or []:
@@ -1755,8 +1761,8 @@ def read_urlopen_sse(
                         if content:
                             parts.append(str(content))
             if parts:
-                return {"text": "".join(parts), "usage": usage}
-            raise RuntimeError("Bailian stream completed without text output.")
+                return {"text": "".join(parts), "usage": usage, "model": model}
+            raise RuntimeError("Model stream completed without text output.")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             quota_exhausted = exc.code == 429 and any(
@@ -2724,6 +2730,10 @@ def main() -> None:
         backend = args.review_backend
         if backend == "auto":
             backend = "bailian" if bailian_key else ("gemini" if gemini_key else "zenmux")
+        if backend == "zenmux" and not args.model:
+            fail("ZenMux 后端必须指定 --model，没有备用模型。")
+        if backend == "gemini" and not args.gemini_model:
+            fail("Gemini 后端必须指定 --gemini-model，没有备用模型。")
         if backend == "bailian":
             if not bailian_key and not args.dry_run:
                 fail("DASHSCOPE_API_KEY is not set and ~/.bailian/config.json has no API key.")

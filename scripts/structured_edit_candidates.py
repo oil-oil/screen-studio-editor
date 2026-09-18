@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Build conservative, transcript-grounded micro edits without another model call.
+"""生成旧规则候选，仅用于 benchmark 对照，不进入默认质量剪辑。
 
-Only two benchmark-validated families are emitted: acoustically isolated,
-clearly sustained strong fillers and exact short tail repeats. Broader retake
-hypotheses stay in the model/manual-review path.
+规则不能证明语义可删；语气词和重复句均需 AI 根据上下文及音画判断。
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ from gemini_edit_candidates import (
 )
 
 
-DETECTOR_VERSION = 1
+DETECTOR_VERSION = 2
 DEFAULT_MAX_CANDIDATES = 30
 MIN_AUTOMATIC_FILLER_MS = 400.0
 TYPE_TO_CATEGORY = {
@@ -66,10 +64,7 @@ def build_structured_candidates(
         >= MIN_AUTOMATIC_FILLER_MS
     ]
 
-    # Exact short tail repeats were the only structural micro-cut family with
-    # zero false speech deletions in the five-video benchmark.  Near matches,
-    # repair markers, and pause-bounded spoken islands remain manual-review
-    # hypotheses; sending them to the automatic path reduced precision sharply.
+    # 文本相同只证明重复候选，不能证明中间的独有信息也能删除。
     exact_tail_restarts = [
         item
         for item in tail_restart_candidates(segments, context_window)
@@ -88,8 +83,9 @@ def build_structured_candidates(
         item["detector_type"] = detector_type
         item["planner_category"] = TYPE_TO_CATEGORY[detector_type]
         item["planner_reason"] = (
-            "Conservative local micro-edit gate validated isolation and exactness; "
-            "the final waveform boundary refiner still chooses the splice points."
+            "旧规则发现的孤立长语气词候选；是否可删仍需 AI 判断。"
+            if detector_type == "hard_filler" else
+            "文本重复候选；必须确认删除范围内每段信息都有保留的替代，不能连带删除独有提醒。"
         )
         item["local_acoustic_safe"] = detector_type == "hard_filler"
         result.append(item)

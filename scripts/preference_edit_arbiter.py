@@ -7,8 +7,8 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -16,16 +16,13 @@ from benchmark_autoedit import intersection_duration
 from gemini_edit_candidates import (
     DEFAULT_API_BASE,
     DEFAULT_API_KEY_FILE,
-    clean_for_match,
     extract_json_from_text,
     flatten_words,
     load_transcript,
     post_json,
-    segment_similarity,
     transcript_context,
 )
 from global_edit_planner import file_sha256, grounded_silent_range, transcript_atoms
-from global_edit_planner import END_PUNCTUATION, SOFT_PUNCTUATION, grounding_text
 
 
 CURRENT_GLOBAL_REPORT_NAME = "global-video-planner-v11.json"
@@ -37,45 +34,20 @@ LEGACY_GLOBAL_REPORT_NAMES = (
     "global-video-planner-gemini35flash-v6.json",
 )
 STRUCTURED_REPORT_NAMES = ("structured-edit-candidates-v1.json",)
-DEFAULT_MODEL = "google/gemini-3.5-flash"
-ARBITER_VERSION = 16
-SHORT_SPEECH_GUARD_MAX_MS = 4_000.0
-MIN_SHORT_REPLACEMENT_SIMILARITY = 0.25
+ARBITER_VERSION = 21
 # Every measured pause that the mechanical editor protected because of screen
 # activity must reach the full-video decision pass. The old 2 s threshold hid
 # short setup/navigation gaps before the model could see them.
 PROTECTED_PAUSE_MIN_MS = 0.0
-MAX_GLOBAL_CANDIDATE_SECONDS = 300.0
 PROTECTED_PAUSE_FRAGMENT_GAP_MS = 1_200.0
-LOCAL_TRANSITION_LEADING_GAP_S = 0.6
-LOCAL_TRANSITION_RETAINED_LEADING_SILENCE_S = 0.22
-LOCAL_TRANSITION_MAX_DURATION_S = 2.5
 CANDIDATE_SEQUENCE_GAP_S = 4.0
-FAILED_TAKE_CATEGORIES = {
-    "abandoned_take",
-    "explicit_restart",
-    "duplicate_take",
-    "failed_demo_narration",
-    "self_correction",
-}
 AUTOMATIC_SCREEN_CUT_ROLES = {
     "failed_take",
     "setup_navigation",
     "loading_wait",
     "dead_air",
 }
-SHOWCASE_INVITATION_RE = re.compile(
-    r"(?:给(?:大家|你们)?看(?:一下)?|(?:我们|大家)(?:可以|来)?看(?:一下)?|"
-    r"看(?:一下|看).{0,10}(?:效果|结果|页面|设计|输出)|预览|展示|比较)"
-)
-SHOWCASE_INVITATION_LOOKBACK_S = 30.0
-MIN_SCREEN_LOADING_WAIT_MS = 2_000.0
-STRONG_FILLER_TOKENS = {"呃", "嗯", "啊", "哎", "额", "唉"}
-REPEATED_DELIVERY_MAX_SPAN_S = 2.5
-GLOBAL_CANDIDATE_DETECTORS = {
-    "global_planner",
-    "repeated_delivery_fragment",
-}
+GLOBAL_CANDIDATE_DETECTORS = {"global_planner"}
 
 
 def load_json(path: Path) -> Any:
@@ -90,11 +62,16 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def api_key(args: argparse.Namespace) -> str:
-    key = args.api_key or os.environ.get("ZENMUX_API_KEY", "")
+    key = (
+        args.api_key
+        or os.environ.get("SCREEN_STUDIO_EDITOR_API_KEY", "")
+        or os.environ.get("ZENMUX_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
     if not key and args.api_key_file.exists():
         key = args.api_key_file.read_text(encoding="utf-8").strip()
     if not key:
-        raise SystemExit(f"ZenMux key not found in environment or {args.api_key_file}")
+        raise SystemExit(f"API key not found in environment or {args.api_key_file}")
     return key
 
 
@@ -145,39 +122,6 @@ def automatic_safety_blocker(candidate: dict[str, Any]) -> str | None:
         and candidate.get("sequence_role") not in AUTOMATIC_SCREEN_CUT_ROLES
     ):
         return "unsafe_screen_sequence_role"
-    if (
-        candidate_family(candidate) == "screen_pause"
-        and candidate.get("video_review_supplied")
-        and candidate.get("sequence_role") == "dead_air"
-        and str(candidate.get("showcase_invitation") or "").strip()
-        and float(candidate.get("visual_activity_fraction") or 0.0) >= 0.5
-    ):
-        return "invited_showcase_context"
-    duration_ms = float(candidate.get("duration_ms") or 0.0)
-    if not duration_ms and candidate.get("start") is not None and candidate.get("end") is not None:
-        duration_ms = (
-            float(candidate["end"]) - float(candidate["start"])
-        ) * 1000.0
-    if (
-        candidate_family(candidate) == "screen_pause"
-        and candidate.get("sequence_role") == "loading_wait"
-        and duration_ms < MIN_SCREEN_LOADING_WAIT_MS
-    ):
-        return "short_screen_loading_wait"
-    if (
-        candidate_family(candidate) == "speech"
-        and duration_ms < SHORT_SPEECH_GUARD_MAX_MS
-        and not (
-            candidate.get("replacementless_local_cleanup")
-            and candidate.get("planner_confidence") == "high"
-            and candidate.get("video_review_supplied")
-        )
-        and segment_similarity(
-            str(candidate.get("removed_text") or ""),
-            str(candidate.get("kept_text") or ""),
-        ) < MIN_SHORT_REPLACEMENT_SIMILARITY
-    ):
-        return "short_speech_without_structural_replacement"
     return None
 
 
@@ -237,200 +181,6 @@ def merge_protected_pause_fragments(
     return merged
 
 
-def short_transition_candidates(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Propose tiny claim-free transition units for full-video judgment.
-
-    This is intentionally lexical-agnostic: it finds a short punctuated unit at
-    the edge of a long pause, not a hardcoded word. The candidate is only a
-    hypothesis; creator-style multimodal arbitration still decides whether it
-    carries meaning or should be removed.
-    """
-    candidates: list[dict[str, Any]] = []
-    for position in range(1, len(atoms) - 1):
-        previous = atoms[position - 1]
-        atom = atoms[position]
-        following = atoms[position + 1]
-        text = str(atom.get("text") or "").strip()
-        spoken_start = float(atom["start"])
-        spoken_end = float(atom["end"])
-        previous_end = float(previous["end"])
-        end = float(following["start"])
-        start = min(
-            spoken_start,
-            previous_end + LOCAL_TRANSITION_RETAINED_LEADING_SILENCE_S,
-        )
-        if (
-            len(grounding_text(text)) > 2
-            or spoken_end - spoken_start > 1.0
-            or spoken_start - previous_end < LOCAL_TRANSITION_LEADING_GAP_S
-            or end <= start
-            or end - start > LOCAL_TRANSITION_MAX_DURATION_S
-            or not (END_PUNCTUATION.search(text) or SOFT_PUNCTUATION.search(text))
-        ):
-            continue
-        candidates.append({
-            "type": "transcript_transition_hypothesis",
-            "start": start,
-            "end": end,
-            "spoken_start": spoken_start,
-            "spoken_end": spoken_end,
-            "spoken_start_ms": round(spoken_start * 1000.0),
-            "spoken_end_ms": round(spoken_end * 1000.0),
-            "planner_category": "delivery_cleanup",
-            "planner_confidence": "high",
-            "removed_text": text,
-            "removed_quote": text,
-            "kept_text": "",
-            "cut_until_id": str(following["id"]),
-            "replacementless_local_cleanup": True,
-            "short_transition_cleanup": True,
-            "planner_reason": (
-                "A very short punctuated transition unit sits at the edge of a "
-                "long pause; the full-video model must decide whether it carries "
-                "meaning or is only delivery residue."
-            ),
-        })
-    return candidates
-
-
-def dangling_delivery_candidates(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Propose a short clause tail that audibly stops before the next thought."""
-    candidates: list[dict[str, Any]] = []
-    for position in range(1, len(atoms) - 1):
-        previous = atoms[position - 1]
-        atom = atoms[position]
-        following = atoms[position + 1]
-        text = str(atom.get("text") or "").strip()
-        start = float(atom["start"])
-        spoken_end = float(atom["end"])
-        end = float(following["start"])
-        leading_gap = start - float(previous["end"])
-        trailing_gap = end - spoken_end
-        if (
-            len(grounding_text(text)) > 4
-            or spoken_end - start > 1.2
-            or leading_gap < 0.0
-            or leading_gap > 0.5
-            or trailing_gap < 0.5
-            or end <= start
-            or end - start > LOCAL_TRANSITION_MAX_DURATION_S
-            or END_PUNCTUATION.search(text)
-            or not SOFT_PUNCTUATION.search(str(previous.get("text") or ""))
-        ):
-            continue
-        candidates.append({
-            "type": "transcript_dangling_tail_hypothesis",
-            "start": start,
-            "end": end,
-            "spoken_start": start,
-            "spoken_end": spoken_end,
-            "spoken_start_ms": round(start * 1000.0),
-            "spoken_end_ms": round(spoken_end * 1000.0),
-            "planner_category": "delivery_cleanup",
-            "planner_confidence": "high",
-            "removed_text": text,
-            "removed_quote": text,
-            "kept_text": "",
-            "cut_until_id": str(following["id"]),
-            "replacementless_local_cleanup": True,
-            "dangling_delivery_cleanup": True,
-            "planner_reason": (
-                "A very short clause tail stops before a clear following pause; "
-                "the full-video model must decide whether it is a failed delivery "
-                "fragment or meaningful wording."
-            ),
-        })
-    return candidates
-
-
-def repeated_delivery_candidates(
-    segments: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Propose strongly grounded word-level restart patterns for video review.
-
-    ASR sentence atoms often hide small stutters inside otherwise fluent
-    clauses. These lexical patterns only create hypotheses; the full-video
-    arbiter must listen to the splice before any cut can be accepted.
-    """
-    words = flatten_words(segments)
-    normalized = [clean_for_match(str(item.get("word") or "")) for item in words]
-    candidates: list[dict[str, Any]] = []
-    seen: set[tuple[int, int, str]] = set()
-
-    def is_eligible(core: str) -> bool:
-        return bool(core) and not core.isdigit()
-
-    def add_candidate(
-        start_index: int,
-        kept_index: int,
-        evidence: str,
-    ) -> None:
-        start = float(words[start_index]["start"])
-        end = float(words[kept_index]["start"])
-        spoken_end = float(words[kept_index - 1]["end"])
-        if end <= start or end - start > REPEATED_DELIVERY_MAX_SPAN_S:
-            return
-        key = (round(start * 1000.0), round(end * 1000.0), evidence)
-        if key in seen:
-            return
-        seen.add(key)
-        removed_text = "".join(
-            str(item.get("word") or "") for item in words[start_index:kept_index]
-        ).strip()
-        kept_text = str(words[kept_index].get("word") or "").strip()
-        candidates.append({
-            "type": "transcript_repair_hypothesis",
-            "detector_type": "repeated_delivery_fragment",
-            "start": start,
-            "end": end,
-            "spoken_start": start,
-            "spoken_end": spoken_end,
-            "spoken_start_ms": round(start * 1000.0),
-            "spoken_end_ms": round(spoken_end * 1000.0),
-            "planner_category": "delivery_cleanup",
-            "planner_confidence": "high",
-            "removed_text": removed_text,
-            "removed_quote": removed_text,
-            "kept_text": kept_text,
-            "replacementless_local_cleanup": True,
-            "refine_speech_boundaries": True,
-            "repair_evidence": evidence,
-            "planner_reason": (
-                "A word-level repeated or partial delivery pattern is visible "
-                "inside one ASR clause; listen across the exact splice and cut "
-                "only when it is an audible restart rather than emphasis."
-            ),
-        })
-
-    for index in range(len(words) - 2):
-        first = normalized[index]
-        second = normalized[index + 1]
-        complete = normalized[index + 2]
-        if (
-            is_eligible(first)
-            and is_eligible(second)
-            and len(first + second) >= 2
-            and first + second == complete
-        ):
-            add_candidate(index, index + 2, "split_word_restart")
-
-    for index in range(len(words) - 2):
-        core = normalized[index]
-        if not is_eligible(core):
-            continue
-        for kept_index in range(index + 2, min(len(words), index + 4)):
-            if normalized[kept_index] != core:
-                continue
-            bridge = normalized[index + 1:kept_index]
-            has_filler = any(item in STRONG_FILLER_TOKENS for item in bridge)
-            short_bridge = len(core) >= 2 and all(len(item) <= 1 for item in bridge)
-            if has_filler or short_bridge:
-                add_candidate(index, kept_index, "nearby_restart")
-                break
-
-    return sorted(candidates, key=lambda item: (item["start"], item["end"]))
-
-
 def selected_global_report_names(project: Path) -> tuple[str, ...]:
     """Use the current model-neutral planner report, with legacy fallback."""
     if (project / CURRENT_GLOBAL_REPORT_NAME).exists():
@@ -438,25 +188,6 @@ def selected_global_report_names(project: Path) -> tuple[str, ...]:
     return tuple(
         name for name in LEGACY_GLOBAL_REPORT_NAMES if (project / name).exists()
     )
-
-
-def showcase_invitation_before(
-    atoms: list[dict[str, Any]],
-    start: float,
-    *,
-    lookback_s: float = SHOWCASE_INVITATION_LOOKBACK_S,
-) -> str:
-    """Return the nearest explicit invitation to inspect a visual result."""
-    for atom in reversed(atoms):
-        end = float(atom.get("end") or 0.0)
-        if end > start:
-            continue
-        if start - end > lookback_s:
-            break
-        text = str(atom.get("text") or "").strip()
-        if SHOWCASE_INVITATION_RE.search(text):
-            return text
-    return ""
 
 
 def candidate_rows(
@@ -495,15 +226,6 @@ def candidate_rows(
                     ),
                 },
             ))
-    if candidate_source in {"all", "global"}:
-        source_rows.extend(
-            (transcript_path.name, candidate)
-            for candidate in (
-                short_transition_candidates(atoms)
-                + dangling_delivery_candidates(atoms)
-                + repeated_delivery_candidates(segments)
-            )
-        )
     global_report_names = selected_global_report_names(project)
     report_names = (
         global_report_names + STRUCTURED_REPORT_NAMES
@@ -529,9 +251,10 @@ def candidate_rows(
         except (KeyError, TypeError, ValueError):
             continue
         if (
-            start < 0.0
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0.0
             or end <= start
-            or end - start > MAX_GLOBAL_CANDIDATE_SECONDS
         ):
             continue
         row = dict(raw)
@@ -564,7 +287,6 @@ def candidate_rows(
         row["source_report"] = report_name
         context_window_s = 35.0 if candidate_family(row) == "screen_pause" else 12.0
         row["context"] = transcript_context(segments, start, end, context_window_s)
-        row["showcase_invitation"] = showcase_invitation_before(atoms, start)
         key = candidate_key(row)
         existing = rows.get(key)
         # Prefer the grounded v4 proposal when clocks are effectively equal.
@@ -707,7 +429,6 @@ def build_preferences(
                 "visual_activity_fraction": candidate.get("visual_activity_fraction", 0.0),
                 "input_activity_fraction": candidate.get("input_activity_fraction", 0.0),
                 "context": candidate.get("context") or "",
-                "showcase_invitation": candidate.get("showcase_invitation") or "",
             })
     signature = hashlib.sha256(
         json.dumps(
@@ -815,7 +536,6 @@ def prompt_for_arbitration(
         "visual_activity_fraction",
         "input_activity_fraction",
         "context",
-        "showcase_invitation",
         "kept_text",
         "removed_quote",
         "cut_until_id",
@@ -860,7 +580,6 @@ def prompt_for_arbitration(
             "visual_activity_fraction": candidate.get("visual_activity_fraction", 0.0),
             "input_activity_fraction": candidate.get("input_activity_fraction", 0.0),
             "context": candidate.get("context") or "",
-            "showcase_invitation": candidate.get("showcase_invitation") or "",
             "kept_text": candidate.get("kept_text") or "",
             "removed_quote": candidate.get("removed_quote") or "",
             "cut_until_id": candidate.get("cut_until_id"),
@@ -895,7 +614,7 @@ def prompt_for_arbitration(
                 "id": "target_001",
                 "decision": "cut | keep | review",
                 "confidence": "high | medium | low",
-                "reason": "how the creator's demonstrated style applies",
+                "reason": "context, audio/video evidence, and any relevant creator examples",
                 "sequence_assessment": (
                     "how this exact range relates to overlapping candidates, "
                     "the failed attempt, and the retained replacement"
@@ -947,9 +666,26 @@ For isolated_filler, local_acoustic_safe means the splice is technically clean,
 not that this creator necessarily wants that filler removed. A normal topic
 transition is not a retake: if kept_text changes subject instead of restating
 removed_text, keep the candidate."""
+    has_preferences = bool(examples or manual_cut_examples)
+    editing_basis = (
+        "Use the provided examples to learn this creator's editing preferences."
+        if has_preferences else
+        "No creator examples are available. Judge each proposed cut from the "
+        "actual narration, audio/video, and surrounding context. Remove clear "
+        "failed takes, redundant speech, and empty waits while preserving unique "
+        "information and demonstrations; do not invent personal preferences."
+    )
+    compression_guidance = (
+        "The hand-edited removals show which complete supporting commentary or "
+        "overlong examples this creator removes. Apply that evidence only when "
+        "the target serves the same editorial purpose."
+        if manual_cut_examples else
+        "There is no demonstrated preference for broad content compression. "
+        "Preserve coherent passages with unique viewer value."
+    )
     return f"""
-You are learning one creator's PERSONAL talking-head editing style from labeled
-examples. Decide the target candidates in the same style. The labels mean:
+You are editing a talking-head tutorial. {editing_basis}
+When labeled examples are supplied, the labels mean:
 - cut: the creator removed most of this range;
 - keep: the creator intentionally retained it;
 - partial: only part of the proposed range was removed, so the broad range is
@@ -958,7 +694,7 @@ examples. Decide the target candidates in the same style. The labels mean:
 {"A complete source-timeline-aligned video with microphone audio is attached. Every target includes exact source-timeline start_ms/end_ms. Seek to that exact range, then inspect the surrounding sequence before deciding." if video_supplied else "No video is attached to this pass; use the grounded transcript context."}
 {"For every target, report screen_action using only that target's allowed_screen_actions and add a concrete visual_assessment. Telemetry is authoritative: when none is absent, a click or keystroke was recorded; inspect the video and choose redundant only when the action is disposable setup/navigation, otherwise choose meaningful. Use none only when it is allowed and the video confirms that a visual detector fired on a genuinely static range. Use meaningful for unique clicks, typing, demonstrations, readable results, or visual comparisons. A screen_pause can be automatically cleared across detected screen activity only when you return cut/high plus none or redundant and a specific visual assessment; the final editor still treats input telemetry more strictly than visual-only activity." if video_supplied else ""}
 
-Important preferences to infer from examples:
+When examples are available, infer these preferences from them:
 - whether the creator leaves screen navigation or reading time visible;
 - how they handle abandoned takes, repeated wording, and micro-fragments;
 - they prefer a light edit when evidence is ambiguous.
@@ -969,9 +705,8 @@ CREATOR BEHAVIOR SUMMARY:
 HAND-EDITED REMOVALS FROM OTHER VIDEOS:
 {json.dumps(manual_cut_examples or [], ensure_ascii=False)}
 
-These removals include passages that candidate-based examples could not
-represent. Use them to recognize this creator's editorial compression style,
-but keep a target when it contains unique viewer value.
+Use any supplied removals as editorial evidence, but keep a target when it
+contains unique viewer value.
 
 visual_activity_fraction and input_activity_fraction are measured telemetry, not
 model guesses. They prove that something moved; they do not prove that viewers
@@ -984,8 +719,9 @@ result evolution, or timing carries information.
 Never treat a model's planner_reason as ground truth. Compare it with the actual
 removed_text and surrounding context. A sentence that continues grammatically
 after a pause is not an abandoned take. A result showcase or invited reading
-pause is content. Return cut/high only when the creator's examples strongly
-support removing the complete proposed range; otherwise keep or review.
+pause is content. Return cut/high only when the available context and audio/video
+evidence clearly support removing the complete proposed range; otherwise keep
+or review. Apply the creator's preferences when examples are available.
 For replacementless_local_cleanup, listen across the proposed splice. Cut/high
 only when the removed fragment is a delivery defect and the before/after speech
 forms one complete fluent sentence without it; no separate replacement sentence
@@ -994,13 +730,9 @@ Word-level repeated_delivery_fragment candidates are deliberately high-recall
 hypotheses. Confirm the actual audio has a stutter, partial-word restart, or
 abandoned repetition; keep natural emphasis and intentional repeated wording.
 For replacementless_content_compression, cut/high only when the complete passage
-is optional in this creator's demonstrated style and removing it loses no unique
+is optional under the available evidence and removing it loses no unique
 claim, example, number, warning, result, instruction, or screen action.
-Do not keep content_compression merely because it supports the broad theme or is
-well spoken. The hand-edited removals show that this creator sometimes deletes
-complete supporting commentary, personal parallels, and overlong examples to
-tighten pace. Match that demonstrated behavior instead of an abstract preference
-for preserving every coherent sentence.
+{compression_guidance}
 {structured_note}
 Judge the targets as one timeline, not as unrelated snippets. If a cluster of
 screen pauses follows an instruction to pause, read, compare, inspect, score,
@@ -1027,10 +759,13 @@ essential_action are viewer-facing content and must not be cut automatically.
 Use failed_take only when replacement_evidence points to a retained later take
 that recreates the needed narration and screen value. loading_wait and dead_air
 must contain no viewer-facing progression worth watching.
-showcase_invitation contains the nearest explicit transcript invitation to look,
-preview, show, or compare when one occurs shortly before the target. Treat it as
-strong protection for visual activity unless a grounded failed replacement take
-recreates the same viewer-facing result.
+Read the surrounding transcript and watch the video to determine whether the
+speaker invites viewers to look, compare, or inspect a result. Protect that
+viewing time unless a retained replacement take recreates its viewer-facing value.
+Judge semantic redundancy in context: identical wording can serve different
+purposes, and different wording can convey the same information. Filler words
+can express agreement or hesitation; no word list or text similarity score
+authorizes a deletion.
 
 Return strict JSON only:
 {json.dumps(schema, ensure_ascii=False, indent=2)}
@@ -1126,8 +861,10 @@ def arbitration_payload(
             },
             {"role": "user", "content": user_content},
         ],
-        "max_completion_tokens": 12_000,
+        "max_completion_tokens": 32_000,
         "response_format": {"type": "json_object"},
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if not model.startswith("anthropic/"):
         payload["temperature"] = 0
@@ -1137,7 +874,6 @@ def arbitration_payload(
 def relationship_safety_blocker(
     candidate: dict[str, Any],
     decisions_by_id: dict[str, dict[str, Any]],
-    candidates_by_id: dict[str, dict[str, Any]],
 ) -> str | None:
     """Reject a broad cut that contradicts an uncleared contained target."""
     for contained_id in candidate.get("contains_target_ids") or []:
@@ -1150,43 +886,11 @@ def relationship_safety_blocker(
         ):
             return "contained_target_not_cleared"
 
-    group_ids = [str(candidate.get("id") or "")] + [
-        str(item) for item in candidate.get("related_target_ids") or []
-    ]
-    group_candidates = [
-        candidates_by_id[item]
-        for item in group_ids
-        if item in candidates_by_id
-    ]
-    cleared_failed_take = any(
-        item.get("planner_category") in FAILED_TAKE_CATEGORIES
-        and decisions_by_id.get(str(item.get("id") or ""), {}).get("decision") == "cut"
-        and decisions_by_id.get(str(item.get("id") or ""), {}).get("confidence") == "high"
-        for item in group_candidates
-    )
-    if candidate.get("sequence_role") == "failed_take" and (
-        not cleared_failed_take
-        or not str(candidate.get("replacement_evidence") or "").strip()
-    ):
-        return "failed_take_without_grounded_replacement"
-
-    screen_pause_count = sum(
-        candidate_family(item) == "screen_pause" for item in group_candidates
-    )
-    if (
-        screen_pause_count >= 3
-        and not cleared_failed_take
-        and (
-            candidate_family(candidate) == "screen_pause"
-            or candidate.get("replacementless_local_cleanup")
-        )
-    ):
-        return "multi_pause_sequence_requires_manual_review"
     return None
 
 
 def arbitrate(args: argparse.Namespace) -> None:
-    preferences = load_json(args.preferences)
+    preferences = load_json(args.preferences) if args.preferences else {}
     ground_path = args.project / "benchmark-ground-truth.json"
     source_project = (
         str(load_json(ground_path).get("source_project") or "")
@@ -1273,10 +977,8 @@ def arbitrate(args: argparse.Namespace) -> None:
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return
     video_data_url = (
-        "data:video/mp4;base64,"
-        + base64.b64encode(args.video.read_bytes()).decode("ascii")
-        if args.video
-        else None
+        "data:video/mp4;base64," + base64.b64encode(args.video.read_bytes()).decode("ascii")
+        if args.video else None
     )
     endpoint = f"{args.api_base.rstrip('/')}/chat/completions"
     arbiter_key = api_key(args)
@@ -1413,7 +1115,7 @@ def arbitrate(args: argparse.Namespace) -> None:
             blocker = (
                 automatic_safety_blocker(candidate)
                 or relationship_safety_blocker(
-                    candidate, decisions_by_id, by_id
+                    candidate, decisions_by_id
                 )
             )
             if blocker:
@@ -1464,11 +1166,17 @@ def parse_args() -> argparse.Namespace:
     )
     decide = subparsers.add_parser("decide")
     decide.add_argument("--project", type=Path, required=True)
-    decide.add_argument("--preferences", type=Path, required=True)
+    decide.add_argument("--preferences", type=Path)
     decide.add_argument("--output", type=Path, required=True)
-    decide.add_argument("--model", default=DEFAULT_MODEL)
+    decide.add_argument("--model", required=True)
     decide.add_argument("--video", type=Path)
-    decide.add_argument("--api-base", default=DEFAULT_API_BASE)
+    decide.add_argument(
+        "--api-base",
+        default=os.environ.get(
+            "SCREEN_STUDIO_EDITOR_API_BASE",
+            os.environ.get("OPENAI_API_BASE", DEFAULT_API_BASE),
+        ),
+    )
     decide.add_argument("--api-key", default="")
     decide.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE)
     decide.add_argument("--timeout", type=int, default=300)

@@ -11,7 +11,7 @@ description: >
 
 本 Skill 只负责 Screen Studio 工程时间线和工程内屏幕素材。导出成片后的字幕交给 `oil-subtitle`。
 
-脚本负责时间坐标、session 对齐、缓存、活动保护、波形边界和 `project.json` 写入。Agent 负责选择入口、审查候选、确认高风险删除并组织用户预览，不要手工重做脚本内部算法。
+AI 结合完整转录、声音和画面判断重复、口误、语气词及内容取舍。脚本负责静音检测、时间坐标、session 对齐、活动保护、波形切点和 `project.json` 写入。Agent 负责选择入口、审查结果并组织用户预览。
 
 ## API Key 配置入口
 
@@ -39,7 +39,7 @@ bash "$SKILL_DIR/setup.sh"
   "creator_preferences": "/optional/path/to/creator-edit-preferences.json",
   "hotwords": "/optional/path/to/hotwords.json",
   "vocabulary_cache": "/optional/path/to/vocabulary-cache.json",
-  "model": "google/gemini-3.7-flash",
+  "model": "google/gemini-3.8-flash",
   "smart_edit": {
     "pause_threshold_ms": 700,
     "min_pause_ms": 180
@@ -64,7 +64,7 @@ bash "$SKILL_DIR/setup.sh"
 }
 ```
 
-命令行参数优先于环境变量，环境变量优先于用户配置。不要提交用户配置、API Key、个人路径、偏好样本或 benchmark 数据。
+命令行参数优先于环境变量，环境变量优先于用户配置。质量剪辑必须配置 `model`，没有备用模型；直接运行底层模型脚本时显式传入 `--model`。不要提交用户配置、API Key、个人路径、偏好样本或 benchmark 数据。
 
 工程、合并结果、PPT 克隆和工程侧分析产物应放在 `projects_root`；未配置时放在源工程旁边。
 
@@ -81,7 +81,16 @@ bash "$SKILL_DIR/setup.sh"
 
 ### 2. 运行默认质量工作流
 
-质量模式需要 `creator_preferences`。如果尚未配置，先从独立 benchmark 工程构建：
+普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
+
+```bash
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+  --project "/path/to/Project.screenstudio"
+```
+
+该命令默认不写时间线。它内部完成基线 ASR、静音/VAD、屏幕活动分析、对齐代理、AI 全片候选、AI 音画仲裁和最终 dry-run，并复用仍然有效的缓存。执行 Agent 仍需复核语义删点和接缝；模型报告中的画面描述不能代替实际画面核对。
+
+个人偏好样本是可选的。已有独立 benchmark 工程时，可以构建 `creator_preferences`：
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/preference_edit_arbiter.py" build \
@@ -89,7 +98,9 @@ bash "$SKILL_DIR/setup.sh"
   --output "/path/to/creator-edit-preferences.json"
 ```
 
-如果没有个人偏好样本，不要套用其他人的文件；改用下面的“仅清理停顿”。
+没有个人偏好样本时，AI 仍根据完整音画和上下文进行质量剪辑；不要套用别人的偏好，也不要用本次待测工程的已剪答案训练后再评分。
+
+模型对照测试使用相同材料和剪辑要求。用户未要求控制成本或时长时，不自行添加输出长度、思考预算或运行时长限制；记录服务端实际结束原因。截断、断连和格式失败单独报告，不能当成剪辑准确率。盲测不介入删点，人工版仅用于事后评分。
 
 
 普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
@@ -106,12 +117,15 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" 
 读取工程根目录下的 `smart-edit-final-report.json`，至少检查：
 
 - 每一条 smart cut 的删除文本、保留文本和理由；
+- 检查带有 `risk_flags` 标记的候选（如以“但是/不过/然而”等转折词开头的切点），连读确认切口连贯且未丢失独有信息；
 - 所有超过 5 秒的删除；
 - 屏幕有点击、键盘输入或持续变化的候选；
 - 原始时长、新时长和节省时间是否合理；
-- 是否出现模型拒绝、安全拦截或坐标指纹错误。
+- 是否出现模型拒绝、安全拦截或时间坐标错误。
 
-相似措辞不等于重复。后一句增加上下文、结果、警告、操作或画面变化时必须保留。
+语义候选和删除决策都由 AI 根据上下文及音画判断，不使用正则、固定词表、字数或文本相似度代替判断；“嗯”“啊”也可能表达确认，不能直接删除。文本匹配只用于核对 AI 指定的原文和时间位置。
+相同措辞可能承担不同作用，不同措辞也可能语义重复。重复句之间的独有提醒、结果和操作必须保留；脚本不能擅自扩大 AI 选中的删除范围。
+删除重录后，连读保留的前后两句，确认主语、转折和独有信息仍完整；不能因后面有更流畅的重录，就把前面的整段介绍一并删除。
 
 ### 4. 应用同一批已审查决策
 
@@ -123,7 +137,7 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" 
   --apply
 ```
 
-`--apply` 应复用刚才的缓存和候选。如果工程在审查后被 Screen Studio 修改或重新保存，先重新 dry-run，不能强行套用旧结果。
+`--apply` 直接使用已审查的 cuts 和本地分析，不再请求模型生成候选。如果需要废弃既有切片、从原始备份 `project.json.bak` 重新应用，可追加 `--discard-external-edits`。如果工程在审查后被 Screen Studio 修改或重新保存，先重新 dry-run，不能强行套用旧结果。
 
 ### 5. 交付预览
 
@@ -133,7 +147,7 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" 
 
 ## 模式 B：仅清理停顿
 
-只有用户明确不需要语义剪辑，或没有 `creator_preferences` 时才使用。
+只有用户明确不需要语义剪辑时使用。
 
 先 dry-run：
 

@@ -11,7 +11,7 @@
 ## 四种用法
 
 - **质量剪辑：** 结合声音、ASR、屏幕活动和模型候选，对照创作者偏好给出删除建议。
-- **只清停顿：** 没有偏好样本，或不需要语义剪辑时，只处理静音和过长停顿。
+- **只清停顿：** 不需要语义剪辑时，只处理静音和过长停顿。
 - **合并工程：** 把补录工程追加到主工程末尾，或插到指定 slice 之后。
 - **口播换 PPT：** 在克隆工程上，把占位屏幕轨换成按讲述对齐的页面。
 
@@ -45,11 +45,13 @@ Agent 的完整执行规范见 [SKILL.md](SKILL.md)。
   --project "/path/to/Tutorial.screenstudio"
 ```
 
-这条命令默认不改时间线。它会完成基线分析、全片候选、偏好仲裁和最终 dry-run，并复用仍然有效的缓存。审查工程旁的 `smart-edit-final-report.json` 后，再加 `--apply`。
+这条命令默认不改时间线。它会完成基线分析、全片候选、AI 音画仲裁和最终 dry-run，并复用仍然有效的缓存。执行 Agent 复核删点与实际画面、审查 `smart-edit-final-report.json` 后，再加 `--apply`。
+
+重复、口误和语气词是否可删，由 AI 结合上下文、声音及画面判断。程序负责静音、时间定位和切点，不用固定词表或相似度决定语义删改。`--apply` 直接应用已审查的 cuts，不再重新请求模型。
 
 如果工程在审查后被 Screen Studio 重新保存，先重新 dry-run，不要套用旧结果。应用后在 Screen Studio 里预览工程；导出 MP4 之前由使用者确认。
 
-没有 `creator_preferences` 时，不要借用别人的偏好文件，改用只清停顿。
+`creator_preferences` 可选；缺少样本时仍由 AI 根据音画和上下文剪辑，不借用别人的偏好文件。
 
 ## 配置放在用户目录
 
@@ -64,7 +66,7 @@ Agent 的完整执行规范见 [SKILL.md](SKILL.md)。
   "projects_root": "/path/to/screen-studio-projects",
   "creator_preferences": "/path/to/creator-edit-preferences.json",
   "hotwords": "/path/to/hotwords.json",
-  "model": "google/gemini-3.7-flash"
+  "model": "google/gemini-3.8-flash"
 }
 ```
 

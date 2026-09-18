@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import io
 import json
 import sys
 import tempfile
@@ -506,7 +507,7 @@ class CandidateRecallTests(unittest.TestCase):
         ]
         found = candidates.tail_restart_candidates(transcript, 4.0)
         self.assertTrue(any(
-            item["start_ms"] == 3000 and item["end_ms"] == 13_000
+            item["start_ms"] == 3000 and item["end_ms"] == 6000
             for item in found
         ))
 
@@ -953,7 +954,7 @@ class PreferenceArbiterTests(unittest.TestCase):
 
         self.assertEqual(
             preference_edit_arbiter.relationship_safety_blocker(
-                candidate, decisions, {}
+                candidate, decisions
             ),
             "contained_target_not_cleared",
         )
@@ -963,11 +964,11 @@ class PreferenceArbiterTests(unittest.TestCase):
         })
         self.assertIsNone(
             preference_edit_arbiter.relationship_safety_blocker(
-                candidate, decisions, {}
+                candidate, decisions
             )
         )
 
-    def test_multi_pause_showcase_cluster_requires_manual_review(self):
+    def test_pause_count_does_not_override_ai_decisions(self):
         candidates = {
             "target_001": {
                 "id": "target_001",
@@ -990,12 +991,20 @@ class PreferenceArbiterTests(unittest.TestCase):
             for target_id in candidates
         }
 
-        self.assertEqual(
+        self.assertIsNone(
             preference_edit_arbiter.relationship_safety_blocker(
-                candidates["target_001"], decisions, candidates
-            ),
-            "multi_pause_sequence_requires_manual_review",
+                candidates["target_001"], decisions
+            )
         )
+
+    def test_delivery_cleanup_with_grounded_replacement_is_not_blocked_by_category(self):
+        row = {"id": "target_001", "planner_category": "delivery_cleanup",
+               "kept_text": "安装完成之后", "replacement_ids": ["U0002"],
+               "sequence_role": "failed_take", "replacement_evidence": "保留 U0002"}
+        decisions = {row["id"]: {"decision": "cut", "confidence": "high"}}
+        self.assertIsNone(preference_edit_arbiter.relationship_safety_blocker(
+            row, decisions
+        ))
 
     def test_screen_pause_requires_safe_structured_sequence_role(self):
         candidate = {
@@ -1137,30 +1146,16 @@ class PreferenceArbiterTests(unittest.TestCase):
 
             self.assertEqual(rows, [])
 
-    def test_short_speech_needs_structural_replacement_before_auto_cut(self):
-        unrelated = {
-            "start": 10.0,
-            "end": 12.8,
-            "duration_ms": 2800,
-            "planner_category": "abandoned_take",
-            "removed_text": "我们在内置，呃，浏览器调试，呃",
-            "kept_text": "做这些自动化工作会更加方便",
+    def test_text_similarity_does_not_override_ai_semantic_decision(self):
+        candidate = {
+            "start": 10.0, "end": 12.8, "duration_ms": 2800,
+            "planner_category": "duplicate_take",
+            "removed_text": "点右上角的叉就能退出",
+            "kept_text": "按关闭按钮离开这个窗口",
         }
-        exact_restart = {
-            **unrelated,
-            "removed_text": "然后除此以外",
-            "kept_text": "然后除此以外它还增加了一个档位",
-        }
-        long_take = {**unrelated, "duration_ms": 5000}
-
-        self.assertEqual(
-            preference_edit_arbiter.automatic_safety_blocker(unrelated),
-            "short_speech_without_structural_replacement",
-        )
         self.assertIsNone(
-            preference_edit_arbiter.automatic_safety_blocker(exact_restart)
+            preference_edit_arbiter.automatic_safety_blocker(candidate)
         )
-        self.assertIsNone(preference_edit_arbiter.automatic_safety_blocker(long_take))
 
     def test_video_must_explicitly_clear_screen_pause_activity(self):
         candidate = {
@@ -1250,31 +1245,6 @@ class PreferenceArbiterTests(unittest.TestCase):
             self.assertEqual(result["examples"][0]["overlap_fraction"], 0.75)
             self.assertEqual(result["examples"][0]["speech_overlap_fraction"], 0.0)
             self.assertEqual(result["examples"][0]["label"], "keep")
-
-    def test_smart_cuts_include_nonoverlapping_local_micro_candidate(self):
-        document = smart_edit_workflow.cuts_document(
-            Path("/tmp/example.screenstudio"),
-            {"project_sha256": "abc"},
-            {"candidates": [{
-                "start_ms": 1000, "end_ms": 2500,
-                "planner_category": "abandoned_take",
-            }]},
-            [
-                {
-                    "start_ms": 1200, "end_ms": 2000,
-                    "detector_type": "possible_tail_restart",
-                },
-                {
-                    "start_ms": 3000, "end_ms": 3600,
-                    "detector_type": "hard_filler",
-                    "spoken_start_ms": 3040, "spoken_end_ms": 3520,
-                },
-            ],
-        )
-        self.assertEqual(len(document["cuts"]), 2)
-        self.assertTrue(document["cuts"][1]["local_micro_decision"])
-        self.assertEqual(document["cuts"][1]["candidate_type"], "hard_filler")
-        self.assertEqual(document["cuts"][1]["spoken_start_ms"], 3040)
 
     def test_smart_cut_preserves_multimodal_activity_clearance(self):
         cut = smart_edit_workflow.candidate_cut({
@@ -1373,109 +1343,6 @@ class PreferenceArbiterTests(unittest.TestCase):
             self.assertEqual((rows[0]["start_ms"], rows[0]["end_ms"]), (1200, 4700))
             self.assertEqual(rows[0]["merged_pause_fragments"], 2)
 
-    def test_short_transition_candidate_is_word_agnostic_and_video_reviewed(self):
-        atoms = [
-            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
-            {"id": "U0002", "start": 2.7, "end": 3.0, "text": "好。"},
-            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
-        ]
-
-        rows = preference_edit_arbiter.short_transition_candidates(atoms)
-
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["start_ms"] if "start_ms" in rows[0] else round(rows[0]["start"] * 1000), 2220)
-        self.assertEqual(round(rows[0]["end"] * 1000), 4200)
-        self.assertEqual(rows[0]["removed_text"], "好。")
-        self.assertTrue(rows[0]["replacementless_local_cleanup"])
-
-    def test_short_content_unit_without_punctuation_is_not_transition_candidate(self):
-        atoms = [
-            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
-            {"id": "U0002", "start": 2.7, "end": 3.0, "text": "重点"},
-            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
-        ]
-
-        self.assertEqual(
-            preference_edit_arbiter.short_transition_candidates(atoms),
-            [],
-        )
-
-    def test_semantic_four_character_phrase_is_not_transition_candidate(self):
-        atoms = [
-            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "上一句。"},
-            {"id": "U0002", "start": 2.7, "end": 3.2, "text": "直到现在，"},
-            {"id": "U0003", "start": 4.2, "end": 5.0, "text": "下一句。"},
-        ]
-
-        self.assertEqual(
-            preference_edit_arbiter.short_transition_candidates(atoms),
-            [],
-        )
-
-    def test_dangling_delivery_tail_becomes_full_video_candidate(self):
-        atoms = [
-            {"id": "U0001", "start": 1.0, "end": 2.0, "text": "完整前句，"},
-            {"id": "U0002", "start": 2.3, "end": 3.1, "text": "然后再"},
-            {"id": "U0003", "start": 3.8, "end": 5.0, "text": "重新说清楚。"},
-        ]
-
-        rows = preference_edit_arbiter.dangling_delivery_candidates(atoms)
-
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(
-            (round(rows[0]["start"] * 1000), round(rows[0]["end"] * 1000)),
-            (2300, 3800),
-        )
-        self.assertEqual(rows[0]["removed_text"], "然后再")
-        self.assertTrue(rows[0]["replacementless_local_cleanup"])
-
-    def test_word_level_restarts_become_full_video_hypotheses(self):
-        segments = [{
-            "start": 1.0,
-            "end": 5.0,
-            "text": "看到vibe，不知道呃不知道。",
-            "words": [
-                word("看到", 1.0, 1.4),
-                word("v", 1.4, 1.5),
-                word("ibe", 1.5, 1.8),
-                word("vibe，", 1.8, 2.2),
-                word("不知道", 2.5, 3.0),
-                word("呃，", 3.0, 3.3),
-                word("不知道。", 3.4, 4.0),
-            ],
-        }]
-
-        rows = preference_edit_arbiter.repeated_delivery_candidates(segments)
-
-        self.assertTrue(any(
-            row["repair_evidence"] == "split_word_restart"
-            and row["removed_text"] == "vibe"
-            for row in rows
-        ))
-        self.assertTrue(any(
-            row["repair_evidence"] == "nearby_restart"
-            and "不知道" in row["removed_text"]
-            for row in rows
-        ))
-        self.assertTrue(all(row["refine_speech_boundaries"] for row in rows))
-
-    def test_word_level_restart_detector_ignores_repeated_numbers(self):
-        segments = [{
-            "start": 1.0,
-            "end": 2.0,
-            "text": "0 0 1",
-            "words": [
-                word("0", 1.0, 1.2),
-                word("0", 1.2, 1.4),
-                word("1", 1.4, 1.6),
-            ],
-        }]
-
-        self.assertEqual(
-            preference_edit_arbiter.repeated_delivery_candidates(segments),
-            [],
-        )
-
     def test_global_planner_allows_grounded_short_delivery_cleanup(self):
         atoms = [
             {"id": "U0001", "start": 1.0, "end": 2.0, "text": "前半句"},
@@ -1570,10 +1437,9 @@ class PreferenceArbiterTests(unittest.TestCase):
 
         self.assertEqual(rejected, [])
         self.assertEqual(len(planned), 1)
-        self.assertEqual(planned[0]["start_ms"], 2220)
+        self.assertEqual(planned[0]["start_ms"], 2700)
         self.assertEqual(planned[0]["spoken_start_ms"], 2700)
         self.assertEqual(planned[0]["end_ms"], 4200)
-        self.assertTrue(planned[0]["short_transition_cleanup"])
         self.assertTrue(planned[0]["replacementless_local_cleanup"])
 
     def test_global_planner_preserves_complete_clause_before_dangling_tail(self):
@@ -1588,11 +1454,11 @@ class PreferenceArbiterTests(unittest.TestCase):
             {"id": "U0003", "start": 4.1, "end": 5.5, "text": "最终渲染出来。"},
         ]
         plan = {"edits": [{
-            "remove_start_id": "U0001",
+            "remove_start_id": "U0002",
             "remove_end_id": "U0002",
             "cut_until_id": "U0003",
             "replacement_ids": [],
-            "removed_quote": "它也是通过写代码的方式，然后再",
+            "removed_quote": "然后再",
             "replacement_quote": "",
             "category": "delivery_cleanup",
             "confidence": "high",
@@ -1610,7 +1476,6 @@ class PreferenceArbiterTests(unittest.TestCase):
         self.assertEqual(planned[0]["removed_text"], "然后再")
         self.assertEqual(planned[0]["removed_quote"], "然后再")
         self.assertTrue(planned[0]["replacementless_local_cleanup"])
-        self.assertTrue(planned[0]["planner_range_narrowed_to_tail"])
 
     def test_video_review_can_clear_short_delivery_cleanup_without_replacement(self):
         candidate = {
@@ -1706,6 +1571,20 @@ class PreferenceArbiterTests(unittest.TestCase):
 
 
 class BailianReviewerTests(unittest.TestCase):
+    def test_streaming_model_response_preserves_text_model_and_usage(self):
+        events = [
+            {"model": "test-model", "choices": [{"delta": {"content": '{"edits":'}}]},
+            {"choices": [{"delta": {"content": '[]}'}}]},
+            {"choices": [], "usage": {"total_tokens": 42}},
+        ]
+        body = ''.join('data: '+json.dumps(event)+'\n\n' for event in events)
+        body += 'data: [DONE]\n\n'
+        with mock.patch.object(candidates.urllib.request, "urlopen", return_value=io.BytesIO(body.encode())):
+            result = candidates.post_json("https://example.invalid/chat", {"stream": True}, "test", 30)
+        self.assertEqual(result["model"], "test-model")
+        self.assertEqual(result["choices"][0]["message"]["content"], '{"edits":[]}')
+        self.assertEqual(result["usage"]["total_tokens"], 42)
+
     def test_json_extractor_ignores_text_after_first_complete_object(self):
         parsed = candidates.extract_json_from_text(
             '{"decisions": []}\nAdditional non-JSON explanation.'

@@ -201,6 +201,21 @@ def build(project_dir: Path, *, width: int, height: int, fps: float, force: bool
             description="muxing the aligned multimodal review proxy",
         )
 
+        # 长视频内嵌请求容易在上传时断连；仅压缩给模型的代理，保留完整音轨和源时间。
+        # 显示代理仍保留较高帧率，供本地检查画面与剪点。
+        if combined_path.stat().st_size > 16 * 1024 * 1024:
+            compact_path = output_dir / "combined-timeline.compact.mp4"
+            run_ffmpeg(
+                [
+                    "-i", str(combined_path), "-vf", "fps=1",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                    "-c:a", "aac", "-b:a", "32k", "-t", str(expected_duration),
+                    "-movflags", "+faststart", "-y", str(compact_path),
+                ],
+                description="reducing the inline video request size",
+            )
+            compact_path.replace(combined_path)
+
     video_duration = probe_duration_s(video_path)
     audio_duration = probe_duration_s(audio_path)
     combined_duration = probe_duration_s(combined_path)
@@ -214,10 +229,11 @@ def build(project_dir: Path, *, width: int, height: int, fps: float, force: bool
         fail(
             f"Audio proxy duration drift is {audio_duration - expected_duration:+.3f}s."
         )
-    if abs(combined_duration - expected_duration) > tolerance:
+    combined_tolerance = max(tolerance, 1.0)
+    if abs(combined_duration - expected_duration) > combined_tolerance:
         fail(
             f"Combined proxy duration drift is {combined_duration - expected_duration:+.3f}s "
-            f"(allowed {tolerance:.3f}s)."
+            f"(allowed {combined_tolerance:.3f}s)."
         )
     return {
         "project": str(project_dir),

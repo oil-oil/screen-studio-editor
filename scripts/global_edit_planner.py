@@ -3,8 +3,8 @@
 
 The planner never creates final cuts. It asks a long-context reasoning model
 to find abandoned takes, restarts, and genuinely duplicate explanations across
-the whole recording. The bounded candidates then go through the existing
-audio/video reviewer and semantic veto in ``gemini_edit_candidates.py``.
+the whole recording. The bounded candidates then go through the
+full-video AI arbitration in ``preference_edit_arbiter.py``.
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +30,7 @@ from gemini_edit_candidates import (
 )
 
 
-DEFAULT_MODEL = "google/gemini-3.5-flash"
-PLANNER_VERSION = 11
-LEADING_SILENCE_RETAINED_FOR_LOCAL_CLEANUP_S = 0.22
+PLANNER_VERSION = 12
 END_PUNCTUATION = re.compile(r"[。！？!?；;]$")
 SOFT_PUNCTUATION = re.compile(r"[，,：:]$")
 VALID_CATEGORIES = {
@@ -62,13 +62,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional creator preference file with hand-edited cut examples.",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", required=True)
     parser.add_argument(
         "--video",
         type=Path,
         help="Optional full aligned MP4 with microphone audio for global video review.",
     )
-    parser.add_argument("--api-base", default=DEFAULT_API_BASE)
+    parser.add_argument(
+        "--api-base",
+        default=os.environ.get(
+            "SCREEN_STUDIO_EDITOR_API_BASE",
+            os.environ.get("OPENAI_API_BASE", DEFAULT_API_BASE),
+        ),
+    )
     parser.add_argument("--api-key", default="")
     parser.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE)
     parser.add_argument("--timeout", type=int, default=300)
@@ -82,18 +88,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-candidate-ms",
         type=float,
-        default=90_000.0,
-        help="Reject unbounded planner spans longer than this (default: 90s).",
+        help="Optional duration cap for experiments; grounded ranges are uncapped by default.",
+    )
+    parser.add_argument(
+        "--chunk-duration",
+        type=float,
+        default=210.0,
+        help="Target chunk duration in seconds for sliding-window candidate discovery (default: 210s).",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=float,
+        default=35.0,
+        help="Overlap duration in seconds between adjacent chunks (default: 35s).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Number of concurrent worker threads for chunked planning (default: 5).",
+    )
+    parser.add_argument(
+        "--no-chunk",
+        action="store_true",
+        help="Disable sliding-window chunking and run a single monolithic pass.",
     )
     return parser.parse_args()
 
 
 def api_key_from_args(args: argparse.Namespace) -> str:
-    key = args.api_key or os.environ.get("ZENMUX_API_KEY", "")
+    key = (
+        args.api_key
+        or os.environ.get("SCREEN_STUDIO_EDITOR_API_KEY", "")
+        or os.environ.get("ZENMUX_API_KEY", "")
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
     if not key and args.api_key_file.exists():
         key = args.api_key_file.read_text(encoding="utf-8").strip()
     if not key and not args.dry_run:
-        fail(f"ZenMux key not found in the environment or {args.api_key_file}.")
+        fail(f"API key not found in the environment or {args.api_key_file}.")
     return key
 
 
@@ -209,7 +242,8 @@ candidate still needs concrete structural evidence.
 
 Include:
 - an abandoned or stumbled earlier take followed by a clean restart;
-- an explicit instruction to restart or recording meta-talk;
+- an extended preliminary or rambling attempt (10-60s) that trails off into a long pause (>3s) or incomplete sentence, followed by the speaker restarting or restructuring the explanation of that step/topic from scratch (e.g. "然后它第三步啊就是...", "那重新看这个..."); propose the ENTIRE preliminary attempt through the pause before the clean restart as an abandoned_take, with replacement_ids set to the clean restart take;
+- explicit instruction to restart, recording meta-talk, accidental live utterances, or off-topic remarks (e.g. telling pets to go away, personal subscription expiring comments, UI loading mutterings, premature outro remarks) that do not belong to the final tutorial;
 - an earlier duplicate take whose intended information is fully present in a
   later cleaner take;
 - a local self-correction where the first wording is clearly superseded;
@@ -224,8 +258,8 @@ Include:
 
 Failed-take grouping:
 - Treat one failed narration/demo attempt as a sequence, not as isolated words.
-  When its apparently useful screen action or result is shown again in the clean
-  replacement take, propose the complete disposable attempt from its earliest
+  When an explanation starts, rambles, trails off, or its screen action is shown again
+  in the clean replacement take, propose the complete disposable attempt from its earliest
   unique utterance through the transition before the clean restart.
 - If the safe boundary is genuinely ambiguous, return both a tight speech-only
   candidate and a broader complete-attempt alternative. This is a high-recall
@@ -239,7 +273,7 @@ Do NOT include:
 - a fluent discourse marker merely because it is short. A filler such as 呃/嗯
   is eligible only when it is acoustically isolated and removing it produces a
   clean splice;
-- fluent explanations merely because they are wordy;
+- fluent finalized explanations that are part of the intended tutorial;
 - a repeated passage that adds a claim, example, number, warning, result, or
   troubleshooting detail;
 {"- a click, command, generated result, or UI transition that viewers need to see;" if video_supplied else "- screen-navigation silence (it is handled by another subsystem);"}
@@ -251,6 +285,10 @@ Do NOT include:
 - stylistic shortening without evidence of a recording mistake.
 
 Semantic safety:
+- Judge redundancy by meaning, context, audio, and screen actions. Identical
+  wording can serve different purposes; different wording can repeat the same
+  information. An 嗯 or 啊 can be a meaningful response rather than disposable
+  hesitation. Do not decide from word lists or text similarity.
 - An ASR segment boundary or pause is not evidence that a sentence was
   abandoned. The following words may simply complete the same sentence.
 - An unusual or possibly mistranscribed model/product name is not proof of a
@@ -263,8 +301,9 @@ Boundaries:
   IDs in one contiguous earlier range.
 - For a purely silent screen_pause, use numeric remove_start_s/remove_end_s
   instead of utterance IDs. Keep the span tight and use video timestamps.
-- cut_until_id is the first utterance that must remain after the cut. Use it
-  when dead air between the failed take and clean restart should also vanish.
+- cut_until_id must immediately follow remove_end_id. It only extends the cut
+  through the following silent gap. To remove intervening speech, explicitly
+  include its IDs in remove_start_id/remove_end_id and assess all of its content.
 - replacement_ids identify the later clean take or correction that preserves
   the meaning. For a high-confidence short local self_correction or
   delivery_cleanup, replacement_ids may be empty only when cut_until_id is the
@@ -433,7 +472,7 @@ def candidates_from_plan(
     atoms: list[dict[str, Any]],
     *,
     model: str,
-    max_candidate_ms: float,
+    max_candidate_ms: float | None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     by_id = {str(item["id"]): item for item in atoms}
     positions = {str(item["id"]): index for index, item in enumerate(atoms)}
@@ -487,7 +526,12 @@ def candidates_from_plan(
             start = float(by_id[start_id]["start"])
             spoken_end = float(by_id[end_id]["end"])
             end = spoken_end
-            if cut_until_id in by_id and positions[cut_until_id] > positions[end_id]:
+            # If cut_until_id is not specified, default to the next atom to bridge trailing silence safely
+            if not cut_until_id and positions[end_id] + 1 < len(atoms):
+                cut_until_id = atoms[positions[end_id] + 1]["id"]
+
+            # 只扩展相邻静音，不越过未被模型选中的发言。
+            if cut_until_id in by_id and positions[cut_until_id] == positions[end_id] + 1:
                 proposed_end = float(by_id[cut_until_id]["start"])
                 if proposed_end - spoken_end <= 20.0:
                     end = proposed_end
@@ -506,88 +550,12 @@ def candidates_from_plan(
                 )
             )
         ]
-        planner_range_narrowed_to_tail = False
-        short_transition_cleanup = False
-        semantic_spoken_start = start
         removed_quote_value = str(raw.get("removed_quote") or "").strip()
-        if (
-            not timed_pause
-            and category == "delivery_cleanup"
-            and confidence == "high"
-            and not replacement_ids
-            and cut_until_id in by_id
-            and positions[cut_until_id] == positions[end_id] + 1
-            and len(removed_atoms) > 1
-        ):
-            tail_atom = removed_atoms[-1]
-            preceding_text = "".join(
-                str(item.get("text") or "") for item in removed_atoms[:-1]
-            ).strip()
-            tail_text = str(tail_atom.get("text") or "").strip()
-            tail_start = float(tail_atom["start"])
-            tail_spoken_end = float(tail_atom["end"])
-            tail_end = float(by_id[cut_until_id]["start"])
-            if (
-                len(grounding_text(tail_text)) <= 10
-                and len(grounding_text(preceding_text)) >= 8
-                and bool((END_PUNCTUATION.search(preceding_text) or SOFT_PUNCTUATION.search(preceding_text)))
-                and not END_PUNCTUATION.search(tail_text)
-                and tail_spoken_end - tail_start <= 1.5
-                and tail_end - tail_start <= 2.5
-            ):
-                # A model may correctly identify a dangling tail but include the
-                # useful clause before it. Preserve that clause and keep only
-                # the tightly bounded tail as a review candidate.
-                original_start_id = start_id
-                start_id = end_id
-                start = tail_start
-                semantic_spoken_start = tail_start
-                spoken_end = tail_spoken_end
-                end = tail_end
-                removed_atoms = [tail_atom]
-                key = (start_id, end_id, cut_until_id)
-                removed_quote_value = tail_text
-                planner_range_narrowed_to_tail = True
-
-        if (
-            not timed_pause
-            and category == "delivery_cleanup"
-            and confidence == "high"
-            and not replacement_ids
-            and cut_until_id in by_id
-            and positions[cut_until_id] == positions[end_id] + 1
-            and len(removed_atoms) == 1
-        ):
-            atom = removed_atoms[0]
-            position = positions[str(atom["id"])]
-            atom_text = str(atom.get("text") or "").strip()
-            atom_start = float(atom["start"])
-            atom_end = float(atom["end"])
-            previous_end = (
-                float(atoms[position - 1]["end"]) if position > 0 else 0.0
-            )
-            leading_gap = atom_start - previous_end
-            if (
-                position > 0
-                and len(grounding_text(atom_text)) <= 4
-                and atom_end - atom_start <= 1.0
-                and leading_gap >= 0.5
-            ):
-                # The model has semantically authorized a tiny transition word.
-                # Include the adjacent leading dead air while retaining the same
-                # pacing cushion used by ordinary pause edits.
-                semantic_spoken_start = atom_start
-                start = min(
-                    atom_start,
-                    previous_end + LEADING_SILENCE_RETAINED_FOR_LOCAL_CLEANUP_S,
-                )
-                short_transition_cleanup = True
-
         duration_ms = (end - start) * 1000.0
         minimum_duration_ms = 800.0 if timed_pause else 600.0
         if (
             duration_ms < minimum_duration_ms
-            or duration_ms > max_candidate_ms
+            or (max_candidate_ms is not None and duration_ms > max_candidate_ms)
             or start < 0.0
             or end > timeline_end + 10.0
         ):
@@ -596,17 +564,9 @@ def candidates_from_plan(
 
         replacementless_local_cleanup = (
             category in {"self_correction", "delivery_cleanup"}
-            and confidence == "high"
+            and confidence in {"high", "medium"}
             and cut_until_id in by_id
             and positions[cut_until_id] == positions[end_id] + 1
-            and duration_ms <= 2_500.0
-            and len(removed_atoms) == 1
-            and (
-                short_transition_cleanup
-                or not END_PUNCTUATION.search(
-                    str(removed_atoms[0].get("text") or "")
-                )
-            )
         )
         replacementless_content_compression = (
             category == "content_compression"
@@ -637,21 +597,41 @@ def candidates_from_plan(
             replacement_quote = grounding_text(
                 str(raw.get("replacement_quote") or "")
             )
-            minimum_quote_length = 1 if short_transition_cleanup else 2
             if (
-                len(removed_quote) < minimum_quote_length
+                not removed_quote
                 or removed_quote not in grounding_text(removed_text)
             ):
                 rejected.append({"proposal": raw, "reason": "removed_quote_mismatch"})
                 continue
-            if replacement_ids and (
-                len(replacement_quote) < 2
-                or replacement_quote not in grounding_text(replacement_text)
-            ):
-                rejected.append(
-                    {"proposal": raw, "reason": "replacement_quote_mismatch"}
-                )
-                continue
+            if replacement_ids:
+                if not replacement_quote:
+                    rejected.append(
+                        {"proposal": raw, "reason": "replacement_quote_mismatch"}
+                    )
+                    continue
+                if replacement_quote not in grounding_text(replacement_text):
+                    first_pos = positions.get(replacement_ids[0])
+                    last_pos = positions.get(replacement_ids[-1])
+                    expanded_ids = list(replacement_ids)
+                    if first_pos is not None and first_pos > 0:
+                        prev_id = atoms[first_pos - 1]["id"]
+                        candidate_text = by_id[prev_id]["text"] + replacement_text
+                        if replacement_quote in grounding_text(candidate_text):
+                            expanded_ids.insert(0, prev_id)
+                            replacement_ids = expanded_ids
+                            replacement_text = candidate_text
+                    if last_pos is not None and last_pos < len(atoms) - 1 and replacement_quote not in grounding_text(replacement_text):
+                        next_id = atoms[last_pos + 1]["id"]
+                        candidate_text = replacement_text + by_id[next_id]["text"]
+                        if replacement_quote in grounding_text(candidate_text):
+                            expanded_ids.append(next_id)
+                            replacement_ids = expanded_ids
+                            replacement_text = candidate_text
+                if replacement_quote not in grounding_text(replacement_text):
+                    rejected.append(
+                        {"proposal": raw, "reason": "replacement_quote_mismatch"}
+                    )
+                    continue
         candidate: dict[str, Any] = {
             "id": f"global_{len(candidates) + 1:03d}",
             "type": "global_paper_edit",
@@ -660,9 +640,9 @@ def candidates_from_plan(
             "start_ms": round(start * 1000.0),
             "end_ms": round(end * 1000.0),
             "duration_ms": round(duration_ms),
-            "spoken_start": semantic_spoken_start,
+            "spoken_start": start,
             "spoken_end": spoken_end,
-            "spoken_start_ms": round(semantic_spoken_start * 1000.0),
+            "spoken_start_ms": round(start * 1000.0),
             "spoken_end_ms": round(spoken_end * 1000.0),
             "removed_text": removed_text,
             "kept_text": replacement_text,
@@ -677,17 +657,245 @@ def candidates_from_plan(
             "replacementless_content_compression": (
                 replacementless_content_compression
             ),
-            "planner_range_narrowed_to_tail": planner_range_narrowed_to_tail,
-            "short_transition_cleanup": short_transition_cleanup,
             "planner_model": model,
         }
-        if planner_range_narrowed_to_tail:
-            candidate["planner_original_start_id"] = original_start_id
         if replacement_ids:
             candidate["kept_start"] = float(by_id[replacement_ids[0]]["start"])
             candidate["kept_end"] = float(by_id[replacement_ids[-1]]["end"])
         candidates.append(candidate)
     return candidates, rejected
+
+
+def chunk_transcript_atoms(
+    atoms: list[dict[str, Any]],
+    target_duration: float = 210.0,
+    overlap: float = 35.0,
+) -> list[list[dict[str, Any]]]:
+    """Split transcript atoms into overlapping windows aligned to natural speech gaps."""
+    if not atoms:
+        return []
+    total_start = float(atoms[0]["start"])
+    total_end = float(atoms[-1]["end"])
+    if total_end - total_start <= target_duration:
+        return [atoms]
+
+    chunks: list[list[dict[str, Any]]] = []
+    start_idx = 0
+    n = len(atoms)
+    while start_idx < n:
+        chunk_start_time = float(atoms[start_idx]["start"])
+        target_end_time = chunk_start_time + target_duration
+        if target_end_time >= total_end:
+            chunks.append(atoms[start_idx:])
+            break
+
+        best_end_idx = start_idx
+        best_score = float("inf")
+        for i in range(start_idx, n):
+            cur_end = float(atoms[i]["end"])
+            next_start = float(atoms[i + 1]["start"]) if i + 1 < n else cur_end
+            gap = next_start - cur_end
+            dist = abs(cur_end - target_end_time)
+            score = dist - (15.0 if gap >= 0.8 else (5.0 if gap >= 0.4 else 0.0))
+            if cur_end >= target_end_time - 30.0 and score < best_score:
+                best_score = score
+                best_end_idx = i
+            if cur_end > target_end_time + 30.0:
+                break
+
+        chunk = atoms[start_idx : best_end_idx + 1]
+        chunks.append(chunk)
+
+        actual_end_time = float(chunk[-1]["end"])
+        next_target_start = actual_end_time - overlap
+        next_start_idx = best_end_idx
+        for j in range(best_end_idx, start_idx, -1):
+            if float(atoms[j]["start"]) <= next_target_start:
+                next_start_idx = j
+                break
+        if next_start_idx <= start_idx:
+            next_start_idx = best_end_idx + 1
+        start_idx = next_start_idx
+
+    return chunks
+
+
+def deduplicate_candidates(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge candidates detected across overlapping window boundaries."""
+    merged: list[dict[str, Any]] = []
+    for cand in candidates:
+        cand_start = float(cand["start_ms"])
+        cand_end = float(cand["end_ms"])
+        cand_dur = cand_end - cand_start
+        if cand_dur <= 0:
+            continue
+        duplicate = False
+        for existing in merged:
+            ex_start = float(existing["start_ms"])
+            ex_end = float(existing["end_ms"])
+            inter = max(0.0, min(cand_end, ex_end) - max(cand_start, ex_start))
+            union = max(cand_end, ex_end) - min(cand_start, ex_start)
+            iou = inter / union if union > 0 else 0.0
+            same_ids = (
+                cand.get("remove_start_id")
+                and cand.get("remove_start_id") == existing.get("remove_start_id")
+                and cand.get("remove_end_id") == existing.get("remove_end_id")
+            )
+            if iou >= 0.6 or same_ids:
+                duplicate = True
+                if cand.get("planner_confidence") == "high" and existing.get("planner_confidence") != "high":
+                    existing.update(cand)
+                break
+        if not duplicate:
+            merged.append(cand)
+
+    merged.sort(key=lambda item: (float(item["start_ms"]), float(item["end_ms"])))
+    for index, item in enumerate(merged, start=1):
+        item["id"] = f"global_{index:03d}"
+    return merged
+
+
+def parse_plan_json(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if not text:
+        return {"edits": []}
+    fenced = re.search(r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```", text, flags=re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    if text.startswith("["):
+        try:
+            arr = json.loads(text)
+            if isinstance(arr, list):
+                return {"edits": arr}
+        except Exception:
+            pass
+    try:
+        val = extract_json_from_text(text)
+        if isinstance(val, dict):
+            if "edits" not in val and any(k in val for k in ("remove_start_id", "category")):
+                return {"edits": [val]}
+            return val
+    except Exception:
+        pass
+    start = text.find("{")
+    if start >= 0:
+        try:
+            val, _end = json.JSONDecoder().raw_decode(text[start:])
+            if isinstance(val, dict):
+                return val
+        except Exception:
+            pass
+    return {"edits": []}
+
+
+def plan_single_chunk(
+    chunk_idx: int,
+    chunk_atoms: list[dict[str, Any]],
+    args: argparse.Namespace,
+    prompt_builder: Any,
+    creator_cut_examples: list[dict[str, Any]],
+    preference_signature: str | None,
+) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """Execute model planning on a single window chunk."""
+    prompt = prompt_builder(
+        chunk_atoms,
+        video_supplied=False,
+        creator_cut_examples=creator_cut_examples,
+    )
+    sig = planner_signature(
+        args.model,
+        chunk_atoms,
+        None,
+        preference_signature,
+        args.editorial_only,
+    )
+    req_path = args.work_dir / f"chunk_{chunk_idx:02d}_request.redacted.json"
+    resp_path = args.work_dir / f"chunk_{chunk_idx:02d}_response.raw.json"
+
+    request_payload: dict[str, Any] = {
+        "model": args.model,
+        "preferences": str(args.preferences) if args.preferences else None,
+        "preference_signature": preference_signature,
+        "editorial_only": args.editorial_only,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a meticulous video paper editor. Return strict JSON only. Keep reason brief (under 20 words).",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "max_completion_tokens": 8000,
+        "response_format": {"type": "json_object"},
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if not args.model.startswith("anthropic/"):
+        request_payload["temperature"] = 0
+    if "qwen" in args.model.lower():
+        request_payload["enable_thinking"] = False
+
+    req_path.write_text(
+        json.dumps(
+            {"signature": sig, "request": redact_payload(request_payload)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if args.dry_run:
+        return chunk_idx, [], [], None
+
+    cached: dict[str, Any] | None = None
+    if args.resume and resp_path.exists():
+        try:
+            stored = json.loads(resp_path.read_text(encoding="utf-8"))
+            if stored.get("signature") == sig:
+                cached = stored
+        except (OSError, json.JSONDecodeError, TypeError):
+            cached = None
+
+    if cached is not None:
+        response = cached["response"]
+    else:
+        last_error = None
+        response = None
+        for attempt in range(2):
+            try:
+                response = post_json(
+                    f"{args.api_base.rstrip('/')}/chat/completions",
+                    request_payload,
+                    api_key_from_args(args),
+                    args.timeout,
+                )
+                break
+            except Exception as error:
+                last_error = error
+                if attempt == 0:
+                    time.sleep(2)
+        if response is None:
+            assert last_error is not None
+            raise last_error
+        resp_path.write_text(
+            json.dumps(
+                {"signature": sig, "response": response},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    plan = parse_plan_json(_response_text(response))
+    cands, rejs = candidates_from_plan(
+        plan,
+        chunk_atoms,
+        model=args.model,
+        max_candidate_ms=args.max_candidate_ms,
+    )
+    usage = response.get("usage") if isinstance(response, dict) else None
+    return chunk_idx, cands, rejs, usage
 
 
 def main() -> None:
@@ -712,118 +920,208 @@ def main() -> None:
         if args.editorial_only and isinstance(item, dict)
     ]
     prompt_builder = build_editorial_prompt if args.editorial_only else build_prompt
-    prompt = prompt_builder(
-        atoms,
-        video_supplied=bool(args.video),
-        creator_cut_examples=creator_cut_examples,
-    )
     preference_signature = (
         str(preferences.get("signature") or "") or None
         if args.editorial_only
         else None
     )
-    signature = planner_signature(
-        args.model,
-        atoms,
-        args.video,
-        preference_signature,
-        args.editorial_only,
-    )
+
     args.work_dir.mkdir(parents=True, exist_ok=True)
-    request_path = args.work_dir / "global_planner_request.redacted.json"
-    response_path = args.work_dir / "global_planner_response.raw.json"
-    user_content: str | list[dict[str, Any]] = prompt
-    if args.video:
-        user_content = [
-            {
-                "type": "file",
-                "file": {
-                    "file_data": (
-                        "data:video/mp4;base64,"
-                        + base64.b64encode(args.video.read_bytes()).decode("ascii")
-                    ),
-                    "filename": args.video.name,
-                },
-            },
-            {"type": "text", "text": prompt},
-        ]
-    request_payload = {
-        "model": args.model,
-        "preferences": str(args.preferences) if args.preferences else None,
-        "preference_signature": preference_signature,
-        "editorial_only": args.editorial_only,
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a meticulous video paper editor. Return strict JSON only.",
-            },
-            {"role": "user", "content": user_content},
-        ],
-        "max_completion_tokens": 16_000,
-        "response_format": {"type": "json_object"},
-    }
-    if not args.model.startswith("anthropic/"):
-        request_payload["temperature"] = 0
-    request_path.write_text(
-        json.dumps(
-            {"signature": signature, "request": redact_payload(request_payload)},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    total_span_s = float(atoms[-1]["end"]) - float(atoms[0]["start"])
+    should_chunk = (
+        not args.no_chunk
+        and not args.video
+        and len(atoms) > 100
+        and total_span_s > args.chunk_duration
     )
 
-    if args.dry_run:
-        plan = {"edits": []}
-        response: dict[str, Any] = {"dry_run": True}
+    if should_chunk:
+        chunks = chunk_transcript_atoms(atoms, args.chunk_duration, args.chunk_overlap)
+        print(
+            f"[global-planner] Transcript covers {total_span_s:.1f}s ({len(atoms)} atoms). "
+            f"Scanning in {len(chunks)} windows (target {args.chunk_duration}s, overlap {args.chunk_overlap}s, concurrency {args.concurrency})...",
+            flush=True,
+        )
+
+        all_candidates: list[dict[str, Any]] = []
+        all_rejected: list[dict[str, Any]] = []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+
+        max_workers = min(args.concurrency, max(1, len(chunks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    plan_single_chunk,
+                    chunk_idx,
+                    chunk,
+                    args,
+                    prompt_builder,
+                    creator_cut_examples,
+                    preference_signature,
+                )
+                for chunk_idx, chunk in enumerate(chunks, start=1)
+            ]
+            for future in as_completed(futures):
+                c_idx, cands, rejs, usage = future.result()
+                all_candidates.extend(cands)
+                all_rejected.extend(rejs)
+                if usage:
+                    total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+                    total_completion_tokens += int(usage.get("completion_tokens") or 0)
+                print(
+                    f"  [window {c_idx:02d}/{len(chunks):02d}] found {len(cands)} candidate(s)",
+                    flush=True,
+                )
+
+        candidates = deduplicate_candidates(all_candidates)
+        report_signature = hashlib.sha256(
+            f"chunked_{PLANNER_VERSION}_{args.model}_{len(chunks)}_{len(atoms)}".encode("utf-8")
+        ).hexdigest()
+        aggregated_usage = {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+        }
+        report = {
+            "schema_version": 1,
+            "planner_version": PLANNER_VERSION,
+            "transcript": str(args.transcript),
+            "video": None,
+            "model": args.model,
+            "signature": report_signature,
+            "atom_count": len(atoms),
+            "chunk_count": len(chunks),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "rejected_proposals": all_rejected,
+            "usage": aggregated_usage,
+            "dry_run": args.dry_run,
+        }
     else:
-        cached: dict[str, Any] | None = None
-        if args.resume and response_path.exists():
-            try:
-                stored = json.loads(response_path.read_text(encoding="utf-8"))
-                if stored.get("signature") == signature:
-                    cached = stored
-            except (OSError, json.JSONDecodeError, TypeError):
-                cached = None
-        if cached is not None:
-            response = cached["response"]
-        else:
-            response = post_json(
-                f"{args.api_base.rstrip('/')}/chat/completions",
-                request_payload,
-                api_key_from_args(args),
-                args.timeout,
-            )
-            response_path.write_text(
-                json.dumps(
-                    {"signature": signature, "response": response},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        plan = extract_json_from_text(_response_text(response))
+        prompt = prompt_builder(
+            atoms,
+            video_supplied=bool(args.video),
+            creator_cut_examples=creator_cut_examples,
+        )
+        signature = planner_signature(
+            args.model,
+            atoms,
+            args.video,
+            preference_signature,
+            args.editorial_only,
+        )
+        request_path = args.work_dir / "global_planner_request.redacted.json"
+        response_path = args.work_dir / "global_planner_response.raw.json"
+        user_content: str | list[dict[str, Any]] = prompt
+        if args.video:
+            user_content = [
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": (
+                            "data:video/mp4;base64,"
+                            + base64.b64encode(args.video.read_bytes()).decode("ascii")
+                        ),
+                        "filename": args.video.name,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ]
+        request_payload = {
+            "model": args.model,
+            "preferences": str(args.preferences) if args.preferences else None,
+            "preference_signature": preference_signature,
+            "editorial_only": args.editorial_only,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a meticulous video paper editor. Return strict JSON only. Keep reason brief (under 20 words).",
+                },
+                {"role": "user", "content": user_content},
+            ],
+            "max_completion_tokens": 16_000,
+            "response_format": {"type": "json_object"},
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if not args.model.startswith("anthropic/"):
+            request_payload["temperature"] = 0
+        if "qwen" in args.model.lower():
+            request_payload["enable_thinking"] = False
+        request_path.write_text(
+            json.dumps(
+                {"signature": signature, "request": redact_payload(request_payload)},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-    candidates, rejected = candidates_from_plan(
-        plan,
-        atoms,
-        model=args.model,
-        max_candidate_ms=args.max_candidate_ms,
-    )
-    report = {
-        "schema_version": 1,
-        "planner_version": PLANNER_VERSION,
-        "transcript": str(args.transcript),
-        "video": str(args.video) if args.video else None,
-        "model": args.model,
-        "signature": signature,
-        "atom_count": len(atoms),
-        "candidate_count": len(candidates),
-        "candidates": candidates,
-        "rejected_proposals": rejected,
-        "usage": response.get("usage") if isinstance(response, dict) else None,
-        "dry_run": args.dry_run,
-    }
+        if args.dry_run:
+            plan = {"edits": []}
+            response: dict[str, Any] = {"dry_run": True}
+        else:
+            cached: dict[str, Any] | None = None
+            if args.resume and response_path.exists():
+                try:
+                    stored = json.loads(response_path.read_text(encoding="utf-8"))
+                    if stored.get("signature") == signature:
+                        cached = stored
+                except (OSError, json.JSONDecodeError, TypeError):
+                    cached = None
+            if cached is not None:
+                response = cached["response"]
+            else:
+                last_error: Exception | None = None
+                response = None
+                for attempt in range(2):
+                    try:
+                        response = post_json(
+                            f"{args.api_base.rstrip('/')}/chat/completions",
+                            request_payload,
+                            api_key_from_args(args),
+                            args.timeout,
+                        )
+                        break
+                    except Exception as error:
+                        last_error = error
+                        if attempt == 0:
+                            time.sleep(2)
+                if response is None:
+                    assert last_error is not None
+                    raise last_error
+                response_path.write_text(
+                    json.dumps(
+                        {"signature": signature, "response": response},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            plan = extract_json_from_text(_response_text(response))
+
+        candidates, rejected = candidates_from_plan(
+            plan,
+            atoms,
+            model=args.model,
+            max_candidate_ms=args.max_candidate_ms,
+        )
+        report = {
+            "schema_version": 1,
+            "planner_version": PLANNER_VERSION,
+            "transcript": str(args.transcript),
+            "video": str(args.video) if args.video else None,
+            "model": args.model,
+            "signature": signature,
+            "atom_count": len(atoms),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "rejected_proposals": rejected,
+            "usage": response.get("usage") if isinstance(response, dict) else None,
+            "dry_run": args.dry_run,
+        }
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",

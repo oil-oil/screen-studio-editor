@@ -26,7 +26,6 @@ from gemini_edit_candidates import (
     redact_payload,
 )
 from global_edit_planner import (
-    DEFAULT_MODEL,
     _response_text,
     candidates_from_plan,
     transcript_atoms,
@@ -47,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", required=True)
     parser.add_argument("--api-base", default=DEFAULT_API_BASE)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--api-key-file", type=Path, default=DEFAULT_API_KEY_FILE)

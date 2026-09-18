@@ -16,8 +16,7 @@ from process import analysis_cache_signature
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL = "google/gemini-3.5-flash"
-WORKFLOW_VERSION = 16
+WORKFLOW_VERSION = 17
 USER_CONFIG_FILE = Path(
     os.environ.get(
         "SCREEN_STUDIO_EDITOR_CONFIG",
@@ -100,7 +99,7 @@ def final_audit_is_current(report: Path, signature: str) -> bool:
 
 def run(command: list[str], description: str) -> None:
     print(f"[smart-edit] {description}...")
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, stdout=subprocess.PIPE, text=True)
     if result.returncode:
         details = (result.stderr or result.stdout).strip()
         fail(f"{description} failed.\n{details}")
@@ -142,23 +141,34 @@ def baseline_is_current(
         return False
 
 
-def candidate_cut(candidate: dict[str, Any], *, local: bool = False) -> dict[str, Any]:
+TRANSITION_CONNECTIVES = (
+    "但是", "不过", "然而", "可是", "也就是说", "所以", "因此", "另外", "同时", "虽然"
+)
+
+
+def candidate_cut(candidate: dict[str, Any]) -> dict[str, Any]:
     detector = str(
         candidate.get("detector_type")
         or candidate.get("planner_category")
         or "candidate"
     )
+    removed_text = str(candidate.get("removed_text") or "").strip()
+    kept_text = str(candidate.get("kept_text") or "").strip()
+    risk_flags = []
+    if any(removed_text.startswith(conn) for conn in TRANSITION_CONNECTIVES):
+        risk_flags.append("starts_with_transition_connective")
+
     cut = {
         "start_ms": candidate["start_ms"],
         "end_ms": candidate["end_ms"],
-        "removed_text": candidate.get("removed_text") or "",
-        "reason": (
-            "local_validated_micro_" if local else "gemini_personalized_"
-        ) + detector,
+        "removed_text": removed_text,
+        "reason": "gemini_personalized_" + detector,
         "confidence": "high",
-        "kept_text": candidate.get("kept_text") or "",
+        "kept_text": kept_text,
         "candidate_type": candidate.get("detector_type") or candidate.get("type"),
     }
+    if risk_flags:
+        cut["risk_flags"] = risk_flags
     for key in ("spoken_start_ms", "spoken_end_ms"):
         if candidate.get(key) is not None:
             cut[key] = candidate[key]
@@ -173,10 +183,7 @@ def candidate_cut(candidate: dict[str, Any], *, local: bool = False) -> dict[str
         )
     ):
         cut["preserve_reviewed_boundaries"] = True
-    if local:
-        cut["local_micro_decision"] = True
-    else:
-        cut["preference_decision"] = candidate.get("preference_decision")
+    cut["preference_decision"] = candidate.get("preference_decision")
     return cut
 
 
@@ -184,29 +191,10 @@ def cuts_document(
     project: Path,
     baseline: dict[str, Any],
     arbiter: dict[str, Any],
-    local_candidates: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     cuts = []
     for candidate in arbiter.get("candidates") or []:
         cuts.append(candidate_cut(candidate))
-    for candidate in local_candidates or []:
-        proposed = candidate_cut(candidate, local=True)
-        proposed_duration = float(proposed["end_ms"]) - float(proposed["start_ms"])
-        if any(
-            max(
-                0.0,
-                min(float(proposed["end_ms"]), float(existing["end_ms"]))
-                - max(float(proposed["start_ms"]), float(existing["start_ms"])),
-            )
-            >= 0.8
-            * min(
-                proposed_duration,
-                float(existing["end_ms"]) - float(existing["start_ms"]),
-            )
-            for existing in cuts
-        ):
-            continue
-        cuts.append(proposed)
     return {
         "schema_version": 2,
         "coordinate_space": "source",
@@ -222,6 +210,11 @@ def main() -> None:
     parser.add_argument("--model")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force-analysis", action="store_true")
+    parser.add_argument(
+        "--discard-external-edits",
+        action="store_true",
+        help="Re-apply from project.json.bak, discarding prior auto-edits or external edits.",
+    )
     args = parser.parse_args()
 
     config = load_user_config()
@@ -231,19 +224,23 @@ def main() -> None:
         or os.environ.get("SCREEN_STUDIO_EDITOR_PREFERENCES")
         or config.get("creator_preferences")
     )
-    if not configured_preferences:
-        fail(
-            "Creator preferences are not configured. Pass --preferences, set "
-            "SCREEN_STUDIO_EDITOR_PREFERENCES, or set creator_preferences in "
-            f"{USER_CONFIG_FILE}."
-        )
-    preferences = Path(configured_preferences).expanduser().resolve()
+    preferences = (
+        Path(configured_preferences).expanduser().resolve()
+        if configured_preferences else None
+    )
+    if preferences and not preferences.exists():
+        if args.preferences:
+            fail(f"指定的偏好文件不存在：{preferences}")
+        print(f"[smart-edit] 偏好文件不存在，本次按音画和上下文判断：{preferences}")
+        preferences = None
     model = (
         args.model
         or os.environ.get("SCREEN_STUDIO_EDITOR_MODEL")
         or config.get("model")
-        or DEFAULT_MODEL
     )
+    if not isinstance(model, str) or not model.strip():
+        fail("未配置剪辑模型；请设置 config.json 的 model、SCREEN_STUDIO_EDITOR_MODEL 或 --model。")
+    model = model.strip()
     smart_edit_config = config.get("smart_edit") or {}
     if not isinstance(smart_edit_config, dict):
         fail(f"smart_edit config must be a JSON object: {USER_CONFIG_FILE}")
@@ -251,20 +248,44 @@ def main() -> None:
     min_pause_ms = float(smart_edit_config.get("min_pause_ms", 180))
     if not (project / "project.json").exists() or not (project / "recording").is_dir():
         fail(f"Not a Screen Studio project: {project}")
-    if not preferences.exists():
-        fail(
-            f"Creator preferences do not exist: {preferences}. Build them with "
-            "preference_edit_arbiter.py build first."
-        )
-
     baseline_report = project / "baseline-report.json"
     transcript = project / "baseline-report.transcript.edit.json"
     planner_report = project / "global-video-planner-v11.json"
     planner_work = project / "global-video-work-v11"
-    structured_report = project / "structured-edit-candidates-v1.json"
     arbiter_report = project / "smart-edit-report.json"
     cuts_path = project / "smart-edit-cuts.json"
     final_report = project / "smart-edit-final-report.json"
+
+    final_command = [
+        sys.executable,
+        str(SCRIPT_DIR / "process.py"),
+        "--project", str(project),
+        "--skip-transcribe", str(transcript),
+        "--reuse-analysis-report", str(baseline_report),
+        "--cuts-file", str(cuts_path),
+        "--pause-threshold", str(pause_threshold_ms),
+        "--min-pause", str(min_pause_ms),
+        "--pause-source", "silence",
+        "--asr-backend", "bailian",
+        "--language", "zh",
+    ]
+    if args.discard_external_edits:
+        final_command.append("--discard-external-edits")
+    if args.apply:
+        if args.force_analysis:
+            fail("重新分析后需要先审查结果，不能同时使用 --force-analysis 和 --apply。")
+        if not all(path.exists() for path in (transcript, baseline_report, cuts_path, final_report)):
+            fail("请先运行 dry-run 并审查剪辑结果。")
+        # 应用时只执行已有 cuts，不再请求模型或覆盖已审查的候选。
+        run(final_command, "applying reviewed cuts")
+        applied = load_json(project / "autoedit-report.json")
+        print(json.dumps({
+            "project": str(project), "applied": True,
+            "original_duration_s": applied["original_duration_ms"] / 1000.0,
+            "projected_duration_s": applied["new_duration_ms"] / 1000.0,
+            "audit": str(project / "autoedit-report.json"),
+        }, ensure_ascii=False, indent=2))
+        return
 
     baseline_command = [
         sys.executable,
@@ -278,19 +299,12 @@ def main() -> None:
         "--dry-run",
         "--report-output", str(baseline_report),
     ]
-    if transcript.exists():
-        baseline_command.extend(["--skip-transcribe", str(transcript)])
+    if args.discard_external_edits:
+        baseline_command.append("--discard-external-edits")
     proxy_command = [
         sys.executable,
         str(SCRIPT_DIR / "build_review_proxy.py"),
         str(project),
-    ]
-    structured_command = [
-        sys.executable,
-        str(SCRIPT_DIR / "structured_edit_candidates.py"),
-        "--transcript", str(transcript),
-        "--activity-report", str(baseline_report),
-        "--output", str(structured_report),
     ]
     baseline_current = (
         not args.force_analysis
@@ -307,10 +321,21 @@ def main() -> None:
         run(proxy_command, "aligned review proxy")
     else:
         run(baseline_command, "local audio, transcript, and activity analysis")
-        run(proxy_command, "aligned review proxy")
-    run(
-        structured_command,
-        "conservative local filler and exact-repeat micro edits",
+        run(proxy_command + ["--force"], "aligned review proxy")
+    if not transcript.exists() or not load_json(baseline_report).get("edit_transcript_cache"):
+        fail("本次转录失败，无法继续语义剪辑；请重试分析。")
+
+    api_base = (
+        os.environ.get("SCREEN_STUDIO_EDITOR_API_BASE")
+        or config.get("api_base")
+    )
+    api_key = (
+        os.environ.get("SCREEN_STUDIO_EDITOR_API_KEY")
+        or config.get("api_key")
+    )
+    timeout = (
+        config.get("timeout")
+        or (int(os.environ["SCREEN_STUDIO_EDITOR_TIMEOUT"]) if "SCREEN_STUDIO_EDITOR_TIMEOUT" in os.environ else None)
     )
 
     combined_video = project / "review-proxy" / "combined-timeline.mp4"
@@ -321,23 +346,39 @@ def main() -> None:
         "--output", str(planner_report),
         "--work-dir", str(planner_work),
         "--model", model,
-        "--resume",
         "--video", str(combined_video),
     ]
+    if not args.force_analysis:
+        planner_command.append("--resume")
+    if api_base:
+        planner_command.extend(["--api-base", str(api_base)])
+    if api_key:
+        planner_command.extend(["--api-key", str(api_key)])
+    if timeout:
+        planner_command.extend(["--timeout", str(timeout)])
     run(planner_command, "Gemini whole-timeline paper edit")
+
     arbiter_command = [
         sys.executable,
         str(SCRIPT_DIR / "preference_edit_arbiter.py"),
         "decide",
         "--project", str(project),
-        "--preferences", str(preferences),
         "--output", str(arbiter_report),
         "--model", model,
         "--candidate-source", "global",
         "--protected-pause-min-ms", "0",
         "--video", str(combined_video),
-        "--resume",
     ]
+    if preferences:
+        arbiter_command.extend(["--preferences", str(preferences)])
+    if not args.force_analysis:
+        arbiter_command.append("--resume")
+    if api_base:
+        arbiter_command.extend(["--api-base", str(api_base)])
+    if api_key:
+        arbiter_command.extend(["--api-key", str(api_key)])
+    if timeout:
+        arbiter_command.extend(["--timeout", str(timeout)])
     run(
         arbiter_command,
         "Gemini creator-style arbitration",
@@ -345,28 +386,11 @@ def main() -> None:
 
     baseline = load_json(baseline_report)
     arbiter = load_json(arbiter_report)
-    structured = load_json(structured_report)
     write_json(
         cuts_path,
-        cuts_document(
-            project, baseline, arbiter, structured.get("candidates") or []
-        ),
+        cuts_document(project, baseline, arbiter),
     )
-    final_command = [
-        sys.executable,
-        str(SCRIPT_DIR / "process.py"),
-        "--project", str(project),
-        "--skip-transcribe", str(transcript),
-        "--reuse-analysis-report", str(baseline_report),
-        "--cuts-file", str(cuts_path),
-        "--pause-threshold", str(pause_threshold_ms),
-        "--min-pause", str(min_pause_ms),
-        "--pause-source", "silence",
-        "--asr-backend", "bailian",
-        "--language", "zh",
-    ]
-    if not args.apply:
-        final_command.extend(["--dry-run", "--report-output", str(final_report)])
+    final_command.extend(["--dry-run", "--report-output", str(final_report)])
     audit_signature = final_audit_signature(
         project,
         cuts_path,
@@ -375,37 +399,34 @@ def main() -> None:
         pause_threshold_ms,
         min_pause_ms,
     )
-    if not args.apply and final_audit_is_current(final_report, audit_signature):
+    if not args.force_analysis and final_audit_is_current(final_report, audit_signature):
         print("[smart-edit] Reusing current final timeline audit.")
     else:
         run(
             final_command,
-            "final timeline audit" if not args.apply else "applying verified timeline",
+            "final timeline audit",
         )
-        if not args.apply:
-            audited = load_json(final_report)
-            audited["smart_edit_audit_signature"] = audit_signature
-            audited["smart_edit_workflow_version"] = WORKFLOW_VERSION
-            write_json(final_report, audited)
+        audited = load_json(final_report)
+        audited["smart_edit_audit_signature"] = audit_signature
+        audited["smart_edit_workflow_version"] = WORKFLOW_VERSION
+        write_json(final_report, audited)
 
-    report = load_json(final_report) if final_report.exists() and not args.apply else {}
+    report = load_json(final_report)
     summary = {
         "project": str(project),
         "model": model,
         "mode": "quality",
-        "applied": args.apply,
+        "applied": False,
         "planner_candidates": load_json(planner_report).get("candidate_count"),
-        "full_video_model_uploads": 3,
-        "structured_candidates": load_json(structured_report).get("candidate_count"),
-        "local_micro_cuts": sum(
-            bool(item.get("local_micro_decision"))
-            for item in load_json(cuts_path).get("cuts") or []
-        ),
         "style_candidates": arbiter.get("candidate_count"),
         "accepted_smart_cuts": arbiter.get("accepted_count"),
         "safety_blocked": arbiter.get("safety_blocked_count"),
+        "flagged_risk_cuts": sum(
+            bool(item.get("risk_flags"))
+            for item in load_json(cuts_path).get("cuts") or []
+        ),
         "cuts": str(cuts_path),
-        "audit": str(final_report) if not args.apply else str(project / "autoedit-report.json"),
+        "audit": str(final_report),
         "original_duration_s": (
             round(float(report.get("original_duration_ms")) / 1000.0, 3)
             if report.get("original_duration_ms") is not None

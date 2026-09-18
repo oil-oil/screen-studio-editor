@@ -958,9 +958,8 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
             cut_end_s = gap_end_s - keep_after_s - SPEECH_PAD_S
 
             cut_duration_ms = (cut_end_s - cut_start_s) * 1000.0
-            # Skip cuts shorter than 300ms: ASR timestamp inaccuracy (±50-200ms)
-            # means a tiny cut is more likely to clip real speech than remove silence.
-            if cut_end_s > cut_start_s and cut_duration_ms >= 300:
+            # Retain speech padding and keep cuts >= 150ms to allow tightening pauses down to 450ms.
+            if cut_end_s > cut_start_s and cut_duration_ms >= 150:
                 pauses.append({
                     "start_ms": cut_start_s * 1000.0,
                     "end_ms": cut_end_s * 1000.0,
@@ -1209,15 +1208,14 @@ def filter_pauses_by_silence(pauses: list[dict], silence_regions: list[tuple[flo
         cut_end_s = p["end_ms"] / 1000.0
         cut_dur = cut_end_s - cut_start_s
 
-        # Find max overlap with any silence region
-        max_overlap = 0.0
-        for (sr_start, sr_end) in silence_regions:
-            overlap = max(0.0, min(cut_end_s, sr_end) - max(cut_start_s, sr_start))
-            max_overlap = max(max_overlap, overlap)
+        # Sum total overlap across all silence regions inside the cut
+        total_overlap = sum(
+            max(0.0, min(cut_end_s, sr_end) - max(cut_start_s, sr_start))
+            for (sr_start, sr_end) in silence_regions
+        )
+        overlap_ratio = total_overlap / cut_dur if cut_dur > 0 else 0.0
 
-        overlap_ratio = max_overlap / cut_dur if cut_dur > 0 else 0.0
-
-        if overlap_ratio >= 0.5:
+        if overlap_ratio >= 0.35:
             confirmed.append(p)
         else:
             skipped.append(p)
@@ -1535,140 +1533,6 @@ def log_long_cuts(cuts: list[dict], threshold_ms: float = 5000.0):
             f"({(c['end_ms']-c['start_ms'])/1000:5.1f}s)  …{before[-20:]} ▶ {after[:20]}…")
 
 
-def load_external_edit_state(project_json_path: Path, state_path: Path) -> bool:
-    """Return True when project.json changed since our last write (external edit)."""
-    if not (state_path.exists() and project_json_path.exists()):
-        return False
-    try:
-        last_sha = json.loads(state_path.read_text()).get("last_written_sha")
-        return bool(last_sha) and last_sha != _file_sha256(project_json_path)
-    except Exception:
-        return False
-
-
-def run_incremental_repeat_cuts(
-    project_json_path: Path,
-    state_path: Path,
-    cuts_file: str,
-    *,
-    protect_screen_activity: bool = True,
-    visual_scan: bool = True,
-    visual_scan_fps: float = 2.5,
-    visual_change_threshold: float = 0.012,
-    allow_active_repeat_cuts: bool = False,
-):
-    """
-    Apply repeat cuts on top of the CURRENT project.json without touching
-    anything else. Used when the project was edited externally (e.g. in
-    Screen Studio) after the first auto-edit run: re-applying from the backup
-    would discard those edits, so instead the new cuts are rebased onto the
-    current timeline. Cut coordinates are source-timeline ms, which survive
-    any slice rearrangement, so this is safe.
-    """
-    with open(project_json_path) as f:
-        project_data = json.load(f)
-
-    scenes = project_data.get("json", {}).get("scenes")
-    if not scenes or not scenes[0].get("slices"):
-        log("❌ project.json has no scenes/slices — unexpected format, aborting.")
-        sys.exit(1)
-
-    try:
-        repeats = detect_repeats(
-            cuts_file,
-            project_data,
-            project_json_path,
-            project_json_path.with_suffix(".json.bak"),
-        )
-    except CutsValidationError as exc:
-        log(f"❌ Unsafe cuts file: {exc}")
-        sys.exit(1)
-    if not repeats:
-        log("❌ No usable cuts in the cuts file — nothing to do.")
-        sys.exit(1)
-
-    project_dir = project_json_path.parent
-    metadata = load_metadata(project_dir)
-    mic_sessions = get_mic_sessions(metadata)
-    transcript_path = project_dir / "transcript.edit.json"
-    if not transcript_path.exists():
-        transcript_path = project_dir / "transcript.json"
-    segments = []
-    if transcript_path.exists():
-        try:
-            segments = json.loads(transcript_path.read_text(encoding="utf-8"))
-        except Exception:
-            segments = []
-
-    session_offsets: list[dict] = []
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            merged_audio = tmp / "merged_mic.wav"
-            session_offsets = merge_audio(project_dir, mic_sessions, merged_audio, tmp)
-            repeats = refine_repeat_cut_boundaries(
-                repeats, flatten_words(segments), merged_audio, session_offsets
-            )
-    except Exception as exc:
-        log(f"⚠️  Incremental boundary refinement unavailable: {exc}")
-
-    if protect_screen_activity and session_offsets:
-        input_activity_intervals = load_input_activity_intervals(
-            project_dir, metadata, session_offsets
-        )
-        visual_activity_intervals: list[tuple[float, float]] = []
-        if visual_scan:
-            visual_activity_intervals = detect_visual_activity_intervals(
-                project_dir,
-                metadata,
-                session_offsets,
-                fps=visual_scan_fps,
-                scene_threshold=visual_change_threshold,
-            )
-        if not allow_active_repeat_cuts:
-            repeats, protected, overrides = protect_reviewed_cuts_with_activity(
-                repeats,
-                merge_intervals(input_activity_intervals, gap_ms=120.0),
-                merge_intervals(visual_activity_intervals, gap_ms=120.0),
-            )
-            if protected:
-                log(f"🛡️  Kept {len(protected)} incremental cut(s) containing screen activity.")
-            if overrides:
-                log(
-                    f"👁️  Applied {len(overrides)} reviewed cut(s) across detected "
-                    "activity explicitly cleared by the multimodal reviewer."
-                )
-        if not repeats:
-            log("❌ Every reviewed cut overlaps protected screen activity — nothing applied.")
-            sys.exit(1)
-
-    original_slices = scenes[0]["slices"]
-    new_slices, cuts_applied = apply_cuts(original_slices, repeats)
-
-    original_duration = sum(s["sourceEndMs"] - s["sourceStartMs"] for s in original_slices)
-    new_duration = sum(s["sourceEndMs"] - s["sourceStartMs"] for s in new_slices)
-
-    project_data["json"]["scenes"][0]["slices"] = new_slices
-    with open(project_json_path, "w") as f:
-        json.dump(project_data, f, ensure_ascii=False, separators=(",", ":"))
-    try:
-        state_path.write_text(json.dumps({"last_written_sha": _file_sha256(project_json_path)}))
-    except Exception:
-        pass
-
-    log("")
-    log("=" * 50)
-    log("✅ Incremental repeat cuts applied to the CURRENT timeline (external edits preserved):")
-    log(f"   Repeats removed:   {len(repeats)}")
-    log(f"   Total cuts:        {cuts_applied}")
-    log(f"   Duration:          {original_duration/1000:.1f}s → {new_duration/1000:.1f}s "
-        f"(saved {(original_duration-new_duration)/1000:.1f}s)")
-    for r in repeats:
-        log(f"  ✂️  \"{r.get('removed_text', '')[:80]}\"")
-    log("")
-    log("Open Screen Studio to preview the result.")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Screen Studio Auto-Editor")
     parser.add_argument("--project", required=True, help="Path to .screenstudio directory")
@@ -1740,7 +1604,6 @@ def main():
 
     project_json_path = project_dir / "project.json"
     backup_path = project_dir / "project.json.bak"
-    state_path = project_dir / ".autoedit-state.json"
     report_path = args.report_output or (
         Path(tempfile.gettempdir()) / f"{project_dir.stem}-autoedit-report.json"
         if args.dry_run else project_dir / "autoedit-report.json"
@@ -1769,57 +1632,13 @@ def main():
     if not args.dry_run:
         backup_project(project_json_path)
 
-    # If project.json changed since our last run, someone edited it externally
-    # (opening/saving in Screen Studio counts). Re-applying from the backup
-    # would silently discard those edits, so:
-    #   - with --cuts-file: rebase the new repeat cuts onto the CURRENT
-    #     timeline and keep everything else untouched;
-    #   - otherwise: refuse, unless --discard-external-edits explicitly asks
-    #     to start over from the original backup.
-    externally_edited = (
-        not args.dry_run
-        and backup_path.exists()
-        and load_external_edit_state(project_json_path, state_path)
-    )
-    if externally_edited and not args.discard_external_edits:
-        log("⚠️  project.json changed since the last auto-edit run "
-            "(edited or re-saved in Screen Studio?).")
-        if args.cuts_file:
-            log("    Applying the new cuts incrementally to the CURRENT timeline; "
-                "external edits are preserved.")
-            run_incremental_repeat_cuts(
-                project_json_path,
-                state_path,
-                args.cuts_file,
-                protect_screen_activity=not args.no_screen_activity_protection,
-                visual_scan=not args.no_visual_scan,
-                visual_scan_fps=args.visual_scan_fps,
-                visual_change_threshold=args.visual_change_threshold,
-                allow_active_repeat_cuts=args.allow_active_repeat_cuts,
-            )
-            return
-        log("    Refusing to re-run the full edit: it would rebuild from project.json.bak")
-        log("    and DISCARD everything changed since the last run.")
-        log("    Either pass --cuts-file to add repeat cuts incrementally, or pass")
-        log("    --discard-external-edits to intentionally start over from the backup.")
-        sys.exit(2)
-
-    # Keep the current slice map as well as the pristine backup. Edited-time
-    # review cuts must be mapped through the exact CURRENT slices that produced
-    # the export, while the full edit is rebuilt idempotently from the backup.
-    with open(project_json_path) as f:
-        current_project_data = json.load(f)
-
-    # Normal runs rebuild from the pristine backup. Dry runs analyze the current
-    # timeline exactly as it exists and never write it.
-    # overwritten, so it always holds the original unedited project.json.
-    # This makes every run idempotent: pauses + repeats are applied to the
-    # original slices, never to already-cut slices from a prior run.
-    if args.dry_run:
-        project_data = json.loads(json.dumps(current_project_data))
+    # 预览和写入使用同一条当前时间线；备份只在显式重建时使用。
+    with project_json_path.open(encoding="utf-8") as handle:
+        current_project_data = json.load(handle)
+    if args.discard_external_edits and backup_path.exists():
+        project_data = json.loads(backup_path.read_text(encoding="utf-8"))
     else:
-        with open(backup_path) as f:
-            project_data = json.load(f)
+        project_data = json.loads(json.dumps(current_project_data))
 
     # Load metadata
     metadata = load_metadata(project_dir)
@@ -2193,12 +2012,6 @@ def main():
             # Write updated project.json
             with open(project_json_path, "w") as f:
                 json.dump(project_data, f, ensure_ascii=False, separators=(",", ":"))
-
-            # Record what we wrote so the next run can detect external edits.
-            try:
-                state_path.write_text(json.dumps({"last_written_sha": _file_sha256(project_json_path)}))
-            except Exception:
-                pass
 
         log("")
         log("=" * 50)
