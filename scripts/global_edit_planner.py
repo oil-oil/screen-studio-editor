@@ -166,13 +166,9 @@ def transcript_atoms(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             token = _word_text(word)
             hard_boundary = bool(END_PUNCTUATION.search(token))
-            soft_boundary = bool(SOFT_PUNCTUATION.search(token)) and (
-                len(text) >= 10
-                or end - start >= 2.5
-                or (len(text) <= 5 and end - start <= 1.0)
-            )
-            gap_boundary = next_start is not None and next_start - end >= 0.55
-            duration_boundary = end - start >= 10.0
+            soft_boundary = bool(SOFT_PUNCTUATION.search(token))
+            gap_boundary = next_start is not None and next_start - end >= 0.45
+            duration_boundary = end - start >= 8.0
             if hard_boundary or soft_boundary or gap_boundary or duration_boundary:
                 atoms.append({"start": start, "end": end, "text": text})
                 current = []
@@ -243,10 +239,12 @@ candidate still needs concrete structural evidence.
 Include:
 - an abandoned or stumbled earlier take followed by a clean restart;
 - an extended preliminary or rambling attempt (10-60s) that trails off into a long pause (>3s) or incomplete sentence, followed by the speaker restarting or restructuring the explanation of that step/topic from scratch (e.g. "然后它第三步啊就是...", "那重新看这个..."); propose the ENTIRE preliminary attempt through the pause before the clean restart as an abandoned_take, with replacement_ids set to the clean restart take;
+- immediate repeated words, stuttered syllables, or delivery stumbles (e.g. speaker stumbles "这个平台他们" right before "他们就是提供..."; propose the stumble as delivery_cleanup);
+- local self-correction or slip-of-the-tongue where words are immediately superseded (e.g. speaker says "就是这个速转快。" then immediately corrects to "就这个转速快，然后..."; propose the slip as self_correction with replacement set to the corrected utterance);
+- false starts or aborted sentence lead-ins where the speaker starts a thought, abandons it, and restarts a different phrasing (e.g. "不过你最好是，" immediately followed by "不过这个门槛就比较高了"; propose the false start as delivery_cleanup or abandoned_take);
 - explicit instruction to restart, recording meta-talk, accidental live utterances, or off-topic remarks (e.g. telling pets to go away, personal subscription expiring comments, UI loading mutterings, premature outro remarks) that do not belong to the final tutorial;
 - an earlier duplicate take whose intended information is fully present in a
   later cleaner take;
-- a local self-correction where the first wording is clearly superseded;
 - a short dangling connector, repeated syllable, hesitation, or delivery
   fragment whose removal makes the surrounding spoken sentence more fluent
   without losing a claim. Listen to the audio instead of relying only on ASR
@@ -563,7 +561,7 @@ def candidates_from_plan(
             continue
 
         replacementless_local_cleanup = (
-            category in {"self_correction", "delivery_cleanup"}
+            category in {"self_correction", "delivery_cleanup", "abandoned_take", "explicit_restart"}
             and confidence in {"high", "medium"}
             and cut_until_id in by_id
             and positions[cut_until_id] == positions[end_id] + 1
@@ -597,10 +595,18 @@ def candidates_from_plan(
             replacement_quote = grounding_text(
                 str(raw.get("replacement_quote") or "")
             )
-            if (
-                not removed_quote
-                or removed_quote not in grounding_text(removed_text)
-            ):
+            gt_removed_text = grounding_text(removed_text)
+            matched_removed = False
+            if removed_quote and removed_quote in gt_removed_text:
+                matched_removed = True
+            elif "..." in removed_quote_value or "…" in removed_quote_value:
+                parts = [p.strip() for p in re.split(r"\.{3,}|…+", removed_quote_value) if p.strip()]
+                if len(parts) >= 2:
+                    head_gt = grounding_text(parts[0])
+                    tail_gt = grounding_text(parts[-1])
+                    if head_gt in gt_removed_text and tail_gt in gt_removed_text:
+                        matched_removed = True
+            if not matched_removed:
                 rejected.append({"proposal": raw, "reason": "removed_quote_mismatch"})
                 continue
             if replacement_ids:
@@ -620,13 +626,17 @@ def candidates_from_plan(
                             expanded_ids.insert(0, prev_id)
                             replacement_ids = expanded_ids
                             replacement_text = candidate_text
-                    if last_pos is not None and last_pos < len(atoms) - 1 and replacement_quote not in grounding_text(replacement_text):
-                        next_id = atoms[last_pos + 1]["id"]
+                    while last_pos is not None and last_pos < len(atoms) - 1 and replacement_quote not in grounding_text(replacement_text):
+                        last_pos += 1
+                        next_id = atoms[last_pos]["id"]
                         candidate_text = replacement_text + by_id[next_id]["text"]
+                        expanded_ids.append(next_id)
+                        replacement_text = candidate_text
                         if replacement_quote in grounding_text(candidate_text):
-                            expanded_ids.append(next_id)
                             replacement_ids = expanded_ids
-                            replacement_text = candidate_text
+                            break
+                        if len(candidate_text) > len(replacement_quote) * 3:
+                            break
                 if replacement_quote not in grounding_text(replacement_text):
                     rejected.append(
                         {"proposal": raw, "reason": "replacement_quote_mismatch"}
