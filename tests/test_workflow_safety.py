@@ -13,6 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import smart_edit_workflow as workflow
+from process import resolve_asr_backend
 
 
 class WorkflowSafetyTests(unittest.TestCase):
@@ -46,6 +47,15 @@ class WorkflowSafetyTests(unittest.TestCase):
                 {"word": "点击右边的保存按钮", "start": 4.0, "end": 5.0}
             ]},
         ]
+
+    def test_asr_backend_precedence_is_explicit_and_bailian_by_default(self):
+        self.assertEqual(resolve_asr_backend(None, {}), "bailian")
+        self.assertEqual(resolve_asr_backend(None, {"asr_backend": "bailian"}), "bailian")
+        self.assertEqual(
+            resolve_asr_backend(None, {"asr_backend": "local", "smart_edit": {"asr_backend": "bailian"}}),
+            "bailian",
+        )
+        self.assertEqual(resolve_asr_backend("local", {"asr_backend": "bailian"}), "local")
 
     def run_workflow(self, *extra):
         calls = []
@@ -114,6 +124,9 @@ class WorkflowSafetyTests(unittest.TestCase):
         self.assertTrue((self.project / "smart-edit-context.json").exists())
         self.assertFalse((self.project / "smart-edit-cuts.json").exists())
         self.assertEqual({Path(call[1]).name for call in calls}, {"process.py", "build_review_proxy.py"})
+        process_calls = [call for call in calls if Path(call[1]).name == "process.py"]
+        self.assertIn("--asr-backend", process_calls[0])
+        self.assertEqual(process_calls[0][process_calls[0].index("--asr-backend") + 1], "bailian")
 
     def test_plan_is_bound_to_context_and_final_cuts_are_source_time(self):
         context = self.prepare_plan()

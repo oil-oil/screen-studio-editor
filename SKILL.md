@@ -50,11 +50,11 @@ bash "$SKILL_DIR/setup.sh"
   "creator_preferences": "/optional/path/to/creator-edit-preferences.json",
   "hotwords": "/optional/path/to/hotwords.json",
   "vocabulary_cache": "/optional/path/to/vocabulary-cache.json",
-  "asr_backend": "local",
+  "asr_backend": "bailian",
   "smart_edit": {
     "pause_threshold_ms": 300,
     "min_pause_ms": 180,
-    "asr_backend": "local"
+    "asr_backend": "bailian"
   },
   "visual_defaults": {
     "enabled": false,
@@ -75,6 +75,10 @@ bash "$SKILL_DIR/setup.sh"
   }
 }
 ```
+
+ASR 后端按固定顺序选择：命令行显式参数优先，其次读取 `smart_edit.asr_backend`，再读取顶层
+`asr_backend`，最后默认使用百炼 `bailian`。本地 Whisper 只有显式指定 `local` 时才会安装或运行，
+不会因为百炼凭据暂时不可读而自动切换到本地模型。
 
 ## 模式 A：质量剪辑
 
@@ -101,7 +105,7 @@ bash "$SKILL_DIR/setup.sh"
 - `smart-edit-context.json`：转录、稳定的 `U0001` 等发言编号、停顿和屏幕活动证据；
 - `review-proxy/combined-timeline.mp4`：供 Agent 在需要时核对声音和画面。
 
-如果希望只用本机 ASR：
+如果确实希望只用本机 ASR（这是显式选择，不是默认回退）：
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
@@ -197,7 +201,6 @@ mkdir -p "$WORK"
   --pause-threshold 300 \
   --min-pause 180 \
   --pause-source silence \
-  --asr-backend local \
   --language zh \
   --dry-run \
   --report-output "$WORK/autoedit-report.json"

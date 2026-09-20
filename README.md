@@ -29,7 +29,8 @@ bash "$SKILL_DIR/setup.sh"
 npx skills add https://github.com/oil-oil/screen-studio-editor
 ```
 
-质量剪辑不需要语义模型 Key。ASR 可以使用本机 Whisper/MLX Whisper；如果选择百炼 FunAudio，只有音频会发送到 ASR 服务。
+质量剪辑不需要语义模型 Key。ASR 默认使用百炼 FunAudio；只有显式选择 `local` 时才使用本机 Whisper/MLX Whisper。
+如果配置了百炼，流程不会因为凭据问题自动切换到本地模型。
 
 把工程路径告诉 Agent：
 
@@ -46,7 +47,7 @@ npx skills add https://github.com/oil-oil/screen-studio-editor
 ```bash
 .venv/bin/python3 scripts/smart_edit_workflow.py \
   --project "/path/to/Tutorial.screenstudio" \
-  --asr-backend local
+  --asr-backend bailian
 ```
 
 脚本生成 `smart-edit-context.json` 和对齐代理。当前 Agent 读取它们，判断哪些是被放弃的重录、真正的口误、孤立的语气词或空等待，并写 `smart-edit-plan.json`。Agent 计划必须绑定 context 的 `project_sha256` 与 `context_sha256`，使用 source 时间轴。
@@ -76,13 +77,16 @@ npx skills add https://github.com/oil-oil/screen-studio-editor
 {
   "projects_root": "/path/to/screen-studio-projects",
   "creator_preferences": "/path/to/creator-edit-preferences.json",
-  "asr_backend": "local",
+  "asr_backend": "bailian",
   "smart_edit": {
     "pause_threshold_ms": 300,
     "min_pause_ms": 180
   }
 }
 ```
+
+ASR 后端选择顺序固定为：命令行显式参数 > `smart_edit.asr_backend` > 顶层 `asr_backend` > 百炼默认。
+`setup.sh` 也只会在后端明确为 `local`，或设置 `SCREEN_STUDIO_EDITOR_INSTALL_LOCAL_ASR=1` 时安装本地 Whisper。
 
 ## 数据边界
 

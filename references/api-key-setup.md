@@ -1,6 +1,6 @@
 # API Key 配置与业务读取
 
-当前质量剪辑的语义判断由调用本 Skill 的 Agent 完成，不需要分析模型 Key。只有选择云端 ASR 时才配置百炼 Key；选择本地 ASR、工程合并或 PPT 替换时不需要新增 Key。
+当前质量剪辑的语义判断由调用本 Skill 的 Agent 完成，不需要分析模型 Key。ASR 默认使用百炼；只有显式选择本地 ASR 时才跳过百炼。选择云端 ASR 时配置百炼 Key；选择本地 ASR、工程合并或 PPT 替换时不需要新增 Key。
 
 ## 首次配置
 
@@ -33,6 +33,8 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" setup transcription
   --project "/path/to/Project.screenstudio" \
   --asr-backend local
 ```
+
+上面的 `local` 是显式选择，只用于离线或对比测试；普通运行不要添加这个参数，程序会按用户配置并默认使用百炼。
 
 使用页面保存的百炼凭据时，通过 `transcription` 包装器运行：
 

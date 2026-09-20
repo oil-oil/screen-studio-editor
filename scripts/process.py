@@ -63,6 +63,32 @@ def load_user_config() -> dict:
     return payload
 
 
+def resolve_asr_backend(explicit: str | None = None, config: dict | None = None) -> str:
+    """Resolve ASR deterministically: CLI > user config > Bailian default.
+
+    Local Whisper is intentionally never an implicit fallback.  If Bailian is
+    configured (or no backend is configured yet), the workflow must stay on
+    Bailian and surface a credential/service error instead of downloading a
+    local model behind the user's back.  Local ASR remains available only when
+    explicitly selected by the CLI or config.
+    """
+    if explicit:
+        backend = str(explicit).strip().lower()
+    else:
+        config = config if config is not None else load_user_config()
+        smart_edit = config.get("smart_edit") or {}
+        if not isinstance(smart_edit, dict):
+            raise SystemExit(f"smart_edit must be a JSON object: {USER_CONFIG_FILE}")
+        backend = str(
+            smart_edit.get("asr_backend")
+            or config.get("asr_backend")
+            or "bailian"
+        ).strip().lower()
+    if backend not in {"bailian", "local"}:
+        raise SystemExit("asr_backend 只能是 bailian 或 local。")
+    return backend
+
+
 def resolve_visual_defaults(args: argparse.Namespace) -> dict | None:
     payload = load_user_config().get("visual_defaults") or {}
     if not isinstance(payload, dict):
@@ -1582,8 +1608,8 @@ def main():
     )
     parser.add_argument("--language", default="zh",
                         help="ASR language code (default: zh). Use 'en' for English, 'None' to auto-detect.")
-    parser.add_argument("--asr-backend", choices=["bailian", "local"], default="bailian",
-                        help="ASR backend for transcript generation. Default: bailian. Use local only for explicit comparison or emergency fallback.")
+    parser.add_argument("--asr-backend", choices=["bailian", "local"], default=None,
+                        help="ASR backend for transcript generation. Default: configured backend, otherwise bailian. Use local only explicitly.")
     parser.add_argument("--discard-external-edits", action="store_true",
                         help="Re-apply everything from the original backup even if project.json was "
                              "edited externally (e.g. in Screen Studio) since the last run, DISCARDING "
@@ -1598,6 +1624,7 @@ def main():
         ),
     )
     args = parser.parse_args()
+    args.asr_backend = resolve_asr_backend(args.asr_backend)
     visual_defaults = resolve_visual_defaults(args)
 
     project_dir = Path(args.project)

@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from process import analysis_cache_signature
+from process import analysis_cache_signature, resolve_asr_backend
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -421,9 +421,12 @@ def main() -> None:
         fail(f"smart_edit config must be a JSON object: {USER_CONFIG_FILE}")
     pause_threshold_ms = float(smart_edit_config.get("pause_threshold_ms", 300))
     min_pause_ms = float(smart_edit_config.get("min_pause_ms", 180))
-    asr_backend = args.asr_backend or str(smart_edit_config.get("asr_backend") or config.get("asr_backend") or "bailian")
-    if asr_backend not in {"bailian", "local"}:
-        fail("asr_backend 只能是 bailian 或 local。")
+    # Keep the same precedence as process.py: explicit CLI > user config >
+    # Bailian default. Local ASR is never selected as an implicit fallback.
+    try:
+        asr_backend = resolve_asr_backend(args.asr_backend, config)
+    except SystemExit as exc:
+        fail(str(exc))
 
     baseline_report = project / "baseline-report.json"
     transcript = project / "baseline-report.transcript.edit.json"
