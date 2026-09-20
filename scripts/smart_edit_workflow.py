@@ -23,7 +23,7 @@ from process import analysis_cache_signature
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-WORKFLOW_VERSION = 20
+WORKFLOW_VERSION = 21
 USER_CONFIG_FILE = Path(
     os.environ.get(
         "SCREEN_STUDIO_EDITOR_CONFIG",

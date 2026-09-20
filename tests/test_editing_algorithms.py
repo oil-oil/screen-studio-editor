@@ -140,6 +140,15 @@ class PauseSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(cuts[0]["duration_ms"], 320.0)
         self.assertAlmostEqual(cuts[0]["end_ms"] - cuts[0]["start_ms"], 140.0)
 
+    def test_audio_silence_overlap_with_asr_word_does_not_veto_cut(self):
+        cuts = process.detect_pauses_from_silence(
+            [(1.0, 1.4)],
+            threshold_ms=300,
+            min_pause_ms=180,
+            segments=[segment(1.0, 1.5, "轻声", [word("轻声", 1.1, 1.2)])],
+        )
+        self.assertEqual(len(cuts), 1)
+
     def test_reusable_analysis_requires_exact_transcript_and_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

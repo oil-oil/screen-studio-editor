@@ -38,7 +38,7 @@ from editing_core import (
 )
 
 
-ANALYSIS_CACHE_VERSION = 4
+ANALYSIS_CACHE_VERSION = 5
 USER_CONFIG_FILE = Path(
     os.environ.get(
         "SCREEN_STUDIO_EDITOR_CONFIG",
@@ -790,13 +790,11 @@ def protect_words_from_cuts(
     min_cut_ms: float = 120.0,
 ) -> list[dict]:
     """
-    Trim or split pause cuts so they never remove ASR-recognized speech.
+    Trim or split ASR-derived pause cuts so they never remove recognized speech.
 
-    Silence detection is the cut source, but a mis-set threshold (or quiet
-    speech) can classify real words as silence. Words are the safety net:
-    subtract every word interval (with padding) from each cut and keep only
-    the remaining pieces that are still worth cutting. Fillers were already
-    stripped from the transcript, so filler-only stretches still get cut.
+    This guard is for pauses inferred from ASR word gaps. Audio-derived silence
+    cuts deliberately do not call it: ASR timestamps can drift into measured
+    silence, and that overlap is evidence to review rather than an automatic veto.
     """
     if not cuts or not words:
         return cuts
@@ -943,6 +941,7 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
         return []
 
     pauses = []
+    min_cut_ms = max(120.0, min(200.0, threshold_ms - min_pause_ms))
     for i in range(len(words) - 1):
         gap_start_s = words[i]["end"]
         gap_end_s = words[i + 1]["start"]
@@ -962,7 +961,6 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
             cut_end_s = gap_end_s - keep_after_s - SPEECH_PAD_S
 
             cut_duration_ms = (cut_end_s - cut_start_s) * 1000.0
-            min_cut_ms = max(120.0, min(200.0, threshold_ms - min_pause_ms))
             if cut_end_s > cut_start_s and cut_duration_ms >= min_cut_ms:
                 pauses.append({
                     "start_ms": cut_start_s * 1000.0,
@@ -972,6 +970,9 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
                     "text_after": words[i + 1]["word"].strip(),
                 })
 
+    pauses = protect_words_from_cuts(
+        pauses, words, pad_ms=60.0, min_cut_ms=min_cut_ms
+    )
     log(f"🔍 Found {len(pauses)} ASR word-gap pause(s) > {threshold_ms}ms to cut.")
     return pauses
 
@@ -1840,13 +1841,10 @@ def main():
 
             pauses = merge_cut_lists(pause_cut_lists)
 
-            # Safety net: silence thresholds can misjudge quiet speech, so never let
-            # a pause cut remove anything ASR recognized as a word. Repeat cuts are
-            # exempt — removing recognized speech is their entire purpose.
-            min_cut_ms = max(120.0, min(200.0, args.pause_threshold - args.min_pause))
-            pauses = protect_words_from_cuts(
-                pauses, flatten_words(segments), min_cut_ms=min_cut_ms
-            )
+            # Audio-derived silence is the deciding evidence. ASR timestamps are
+            # retained for labels and review, but their overlap does not veto a
+            # measured silence cut. ASR-only pause candidates are word-protected
+            # inside detect_pauses_from_asr().
 
         # Load reviewed cuts with explicit coordinate-space/project validation,
         # then refine semantic ASR/Agent ranges to nearby waveform minima.
