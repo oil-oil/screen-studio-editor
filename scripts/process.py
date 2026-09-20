@@ -29,6 +29,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from editing_core import (
     CutsValidationError,
+    annotate_activity_overlaps,
     file_sha256,
     load_cuts_document,
     merge_intervals,
@@ -37,7 +38,7 @@ from editing_core import (
 )
 
 
-ANALYSIS_CACHE_VERSION = 1
+ANALYSIS_CACHE_VERSION = 4
 USER_CONFIG_FILE = Path(
     os.environ.get(
         "SCREEN_STUDIO_EDITOR_CONFIG",
@@ -122,6 +123,7 @@ def analysis_cache_signature(
         "pause_threshold_ms": float(args.pause_threshold),
         "min_pause_ms": float(args.min_pause),
         "pause_source": str(args.pause_source),
+        "asr_backend": str(getattr(args, "asr_backend", "bailian")),
         "silence_db": str(args.silence_db),
         "silence_min_dur": float(args.silence_min_dur),
         "vad_enabled": not bool(args.no_vad),
@@ -625,7 +627,7 @@ def refine_repeat_cut_boundaries(
 ) -> list[dict]:
     """Place semantic cuts in nearby quiet gaps without clipping removed words.
 
-    ASR/model ranges describe *what* should disappear; waveform minima decide
+    ASR/Agent ranges describe *what* should disappear; waveform minima decide
     where the splice should land.  Unlike the old fixed inward 150 ms padding,
     this keeps the whole filler/repeated phrase while protecting its neighbours.
     """
@@ -724,7 +726,7 @@ def refine_repeat_cut_boundaries(
 
         new_start = quiet.quietest_timeline_ms(*start_window, session_offsets) or start_ms
         new_end = quiet.quietest_timeline_ms(*end_window, session_offsets) or end_ms
-        # Model/ASR ranges are the semantic authorization boundary. Waveform
+        # Agent/ASR ranges are the semantic authorization boundary. Waveform
         # refinement may move a splice *inside* that range, never expand it
         # into neighbouring speech or screen actions.
         new_start = min(end_ms, max(start_ms, new_start))
@@ -785,7 +787,7 @@ def protect_words_from_cuts(
     cuts: list[dict],
     words: list[dict],
     pad_ms: float = 60.0,
-    min_cut_ms: float = 300.0,
+    min_cut_ms: float = 120.0,
 ) -> list[dict]:
     """
     Trim or split pause cuts so they never remove ASR-recognized speech.
@@ -900,6 +902,7 @@ def detect_pauses_from_silence(
     """
     words = flatten_words(segments)
     pauses = []
+    min_cut_ms = max(120.0, min(200.0, threshold_ms - min_pause_ms))
 
     for silence_start_s, silence_end_s in silence_regions:
         region_ms = (silence_end_s - silence_start_s) * 1000.0
@@ -911,8 +914,9 @@ def detect_pauses_from_silence(
         cut_end_s = silence_end_s - keep_after_s
         cut_duration_ms = (cut_end_s - cut_start_s) * 1000.0
 
-        # Tiny removals tend to create visible timeline noise without improving pacing.
-        if cut_duration_ms < 300:
+        # Keep the same minimum executable cut as the video-editor Skill.
+        # With a 300ms threshold and 180ms retained air, this is 120ms.
+        if cut_duration_ms < min_cut_ms:
             continue
 
         cut = {
@@ -958,8 +962,8 @@ def detect_pauses_from_asr(segments: list[dict], threshold_ms: float, min_pause_
             cut_end_s = gap_end_s - keep_after_s - SPEECH_PAD_S
 
             cut_duration_ms = (cut_end_s - cut_start_s) * 1000.0
-            # Retain speech padding and keep cuts >= 150ms to allow tightening pauses down to 450ms.
-            if cut_end_s > cut_start_s and cut_duration_ms >= 150:
+            min_cut_ms = max(120.0, min(200.0, threshold_ms - min_pause_ms))
+            if cut_end_s > cut_start_s and cut_duration_ms >= min_cut_ms:
                 pauses.append({
                     "start_ms": cut_start_s * 1000.0,
                     "end_ms": cut_end_s * 1000.0,
@@ -1051,13 +1055,14 @@ def resolve_silence_db(
     return float(requested)
 
 
-def detect_silence_regions(audio_path: Path, noise_db: float = -28.0, min_dur: float = 0.3) -> list[tuple[float, float]]:
+def detect_silence_regions(audio_path: Path, noise_db: float = -28.0, min_dur: float = 0.25) -> list[tuple[float, float]]:
     """
     Use ffmpeg silencedetect to find actual silent regions in the merged audio.
     Returns list of (start_s, end_s) tuples.
 
     noise_db: threshold in dB (default -28dB, matches auto-editor's default)
-    min_dur: minimum silence duration in seconds (default 0.3s)
+    min_dur: minimum silence duration in seconds for the detector (default 0.25s).
+        The final cut still requires a measured region longer than pause_threshold_ms.
     """
     cmd = [
         "ffmpeg", "-i", str(audio_path),
@@ -1096,14 +1101,15 @@ _SILERO_MODEL = None
 def detect_nonspeech_regions_vad(
     audio_path: Path,
     *,
-    min_dur: float = 0.3,
+    min_dur: float = 0.25,
     threshold: float = 0.5,
 ) -> list[tuple[float, float]]:
     """Return non-speech intervals using local Silero VAD.
 
     This complements amplitude silence: keyboard clicks, fan noise and room
-    hiss can be loud but are still not speech. ASR word protection and screen
-    activity protection remain the final safety nets.
+    hiss can be loud but are still not speech. ASR word protection is the final
+    safety net for automatic audio cuts; screen activity is recorded for review
+    and remains a guard only for Agent-reviewed semantic cuts.
     """
     global _SILERO_MODEL
     try:
@@ -1536,7 +1542,7 @@ def log_long_cuts(cuts: list[dict], threshold_ms: float = 5000.0):
 def main():
     parser = argparse.ArgumentParser(description="Screen Studio Auto-Editor")
     parser.add_argument("--project", required=True, help="Path to .screenstudio directory")
-    parser.add_argument("--pause-threshold", type=float, default=700, help="Pause threshold in ms (default: 700)")
+    parser.add_argument("--pause-threshold", type=float, default=300, help="Pause threshold in ms (default: 300)")
     parser.add_argument("--min-pause", type=float, default=180, help="Minimum pause to keep in ms (default: 180)")
     parser.add_argument("--pause-source", choices=["silence", "asr", "both"], default="silence",
                         help="How to find pause cuts. Default: measured silence. ASR is available as an opt-in fallback.")
@@ -1545,8 +1551,8 @@ def main():
                              "measured audio level — adapts to each recording's noise floor. Fixed values: "
                              "lower (e.g. -35) is stricter and keeps more audio (use if speech gets "
                              "clipped); raise toward -20 to cut more aggressively for noisy mics.")
-    parser.add_argument("--silence-min-dur", type=float, default=0.3,
-                        help="Minimum silence length in seconds for silencedetect (default: 0.3).")
+    parser.add_argument("--silence-min-dur", type=float, default=0.25,
+                        help="Minimum detector window in seconds; final cuts still require --pause-threshold (default: 0.25).")
     parser.add_argument("--no-vad", action="store_true",
                         help="Disable local Silero voice-activity detection and use energy silence only.")
     parser.add_argument("--cuts-file", default=None, help="JSON file with repeat cuts (produced by Claude in conversation)")
@@ -1837,10 +1843,13 @@ def main():
             # Safety net: silence thresholds can misjudge quiet speech, so never let
             # a pause cut remove anything ASR recognized as a word. Repeat cuts are
             # exempt — removing recognized speech is their entire purpose.
-            pauses = protect_words_from_cuts(pauses, flatten_words(segments))
+            min_cut_ms = max(120.0, min(200.0, args.pause_threshold - args.min_pause))
+            pauses = protect_words_from_cuts(
+                pauses, flatten_words(segments), min_cut_ms=min_cut_ms
+            )
 
         # Load reviewed cuts with explicit coordinate-space/project validation,
-        # then refine semantic ASR/model ranges to nearby waveform minima.
+        # then refine semantic ASR/Agent ranges to nearby waveform minima.
         try:
             repeats = detect_repeats(
                 args.cuts_file,
@@ -1863,14 +1872,8 @@ def main():
         activity_intervals: list[tuple[float, float]] = []
         input_activity_intervals: list[tuple[float, float]] = []
         visual_activity_intervals: list[tuple[float, float]] = []
-        protected_pauses: list[dict] = (
-            [
-                dict(item)
-                for item in reusable_analysis["pauses_protected_by_activity"]
-            ]
-            if reusable_analysis is not None
-            else []
-        )
+        protected_pauses: list[dict] = []
+        pause_activity_overlaps: list[dict] = []
         protected_repeats: list[dict] = []
         visual_clearance_overrides: list[dict] = []
         if not args.no_screen_activity_protection:
@@ -1879,12 +1882,15 @@ def main():
             activity_intervals = merge_intervals(
                 input_activity_intervals + visual_activity_intervals, gap_ms=120.0
             )
-            if reusable_analysis is None and pauses:
-                pauses, protected_pauses = protect_cuts_with_activity(
+            if pauses:
+                pause_activity_overlaps = annotate_activity_overlaps(
                     pauses, activity_intervals
                 )
-                if protected_pauses:
-                    log(f"🛡️  Kept {len(protected_pauses)} silent interval(s) containing screen activity.")
+                if pause_activity_overlaps:
+                    log(
+                        f"👁️  Recorded {len(pause_activity_overlaps)} screen-activity overlap(s) "
+                        "on audio-derived pause cuts; audio silence remains the deciding rule."
+                    )
             if repeats and not args.allow_active_repeat_cuts:
                 repeats, protected_repeats, visual_clearance_overrides = (
                     protect_reviewed_cuts_with_activity(
@@ -1991,6 +1997,7 @@ def main():
             "pauses_applied": pauses,
             "reviewed_cuts_applied": repeats,
             "pauses_protected_by_activity": protected_pauses,
+            "pauses_with_activity_overlap": pause_activity_overlaps,
             "reviewed_cuts_protected_by_activity": protected_repeats,
             "reviewed_cuts_activity_clearance_overrides": visual_clearance_overrides,
             "input_activity_intervals_ms": input_activity_intervals,

@@ -176,7 +176,7 @@ def ensure_hotword_vocabulary() -> str | None:
 def _glossary_pattern(wrong: str) -> re.Pattern:
     """
     Case-insensitive AND whitespace-tolerant pattern for a glossary entry.
-    Spacing drifts at every stage (ASR tokens, LLM echo, CJK/Latin spacing),
+    Spacing drifts at every stage (ASR tokens, external segmenters, CJK/Latin spacing),
     so "GPT55" must also match "GPT 55" and "cloud call" must match
     "cloudcall" — otherwise entries silently stop matching.
     """
@@ -543,251 +543,9 @@ def _shorten_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return shortened
 
 
-SPLIT_LLM_MODEL = "qwen-plus"
-_SPLIT_WORKERS = 6
-_SPLIT_SYSTEM_PROMPT = """你是字幕断句助手。用户给你一句视频口播的文字，你把它断成适合做视频字幕的短行。
-
-规则：
-1. 只允许插入换行符来断行，绝对不许增加、删除、修改、调换任何字符（包括标点）。
-2. 用尽量少的行数完成切分，每行不超过 24 个汉字宽度（中文字符算 1，英文字母、数字算半个）。
-3. 在自然的语气停顿处断开，每行是语义完整的短语，相邻行长度尽量均衡。
-4. 不要把英文产品名、版本号（如 Claude Code、GPT 5.5、Gemini 3.5 Flash）拆到两行。
-5. 行首不要是「的、了、着、吗、呢、吧、啊」这类粘在前一个短语上的虚词。
-6. 定语和它修饰的中心语放在同一行；「XX的」和后面的名词不要拆开。
-7. 直接输出断好行的文字，不要任何解释、编号或多余内容。"""
-
-
-# Normalization for validating/aligning LLM-split lines: LLMs tend to "fix"
-# punctuation even when told not to, and display punctuation is stripped from
-# subtitles anyway — so comparison and word alignment ignore whitespace and
-# punctuation entirely. Word characters are still matched exactly.
-_ALIGN_NORM_RE = re.compile(
-    rf"[\s{re.escape(DISPLAY_PUNCT)}\-—–―‐~·«»“”‘’\"'()（）《》〈〉「」『』【】\[\]{{}}]+"
-)
-
-
-def _align_norm(text: str) -> str:
-    return _ALIGN_NORM_RE.sub("", text)
-
-
-def _llm_split_text(full_text: str, model: str = SPLIT_LLM_MODEL) -> list[str] | None:
-    """
-    Ask an LLM to insert subtitle line breaks into the transcript text.
-
-    The LLM only chooses break points — the reassembled output must be
-    character-identical to the input (whitespace ignored), otherwise the
-    result is rejected and the caller falls back to rule-based splitting.
-    Phrase structure is a linguistic judgment that hand-tuned token scoring
-    keeps getting wrong in new ways; timing limits stay mechanical.
-    """
-    try:
-        result = subprocess.run(
-            [
-                "bl", "text", "chat",
-                "--model", model,
-                "--system", _SPLIT_SYSTEM_PROMPT,
-                "--message", full_text,
-                "--max-tokens", "8192",
-                "--temperature", "0.1",
-                "--output", "json",
-                "--quiet",
-            ],
-            capture_output=True, text=True, timeout=180,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log(f"WARNING: LLM split call failed: {exc}")
-        return None
-    if result.returncode != 0:
-        log(f"WARNING: LLM split call failed: {(result.stderr or result.stdout)[:200]}")
-        return None
-
-    try:
-        payload = json.loads(result.stdout)
-        content = payload["choices"][0]["message"]["content"]
-    except Exception:
-        content = result.stdout
-
-    lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
-    if not lines:
-        log("WARNING: LLM split returned no lines.")
-        return None
-
-    if _align_norm("".join(lines)) != _align_norm(full_text):
-        log("WARNING: LLM split modified the text; rejecting and falling back to rules.")
-        return None
-    return lines
-
-
-def _align_lines_to_words(
-    lines: list[str], words: list[dict[str, Any]]
-) -> list[dict[str, Any]] | None:
-    """
-    Map LLM-split text lines back to ASR word timestamps.
-
-    Words are concatenated in order; each line consumes its own characters
-    (whitespace and punctuation ignored — see _align_norm) and takes start/end
-    from the first/last word it touches. Any bookkeeping mismatch aborts the
-    whole alignment.
-    """
-    flat = ""
-    char_owner: list[int] = []
-    for idx, word in enumerate(words):
-        text = _align_norm(word.get("word") or "")
-        flat += text
-        char_owner.extend([idx] * len(text))
-
-    segments = []
-    pos = 0
-    for line in lines:
-        stripped = _align_norm(line)
-        if not stripped:
-            continue
-        start_pos, end_pos = pos, pos + len(stripped)
-        if end_pos > len(flat) or flat[start_pos:end_pos] != stripped:
-            return None
-        owners = char_owner[start_pos:end_pos]
-        first_word, last_word = words[owners[0]], words[owners[-1]]
-        segments.append({
-            "start": round(float(first_word["start"]), 3),
-            "end": round(float(last_word["end"]), 3),
-            "text": line,
-            "words": [words[i] for i in sorted(set(owners))],
-        })
-        pos = end_pos
-    if pos != len(flat):
-        return None
-    return segments
-
-
-def _is_fragment(segment: dict[str, Any]) -> bool:
-    min_chars = max(8.0, MAX_SUBTITLE_CHARS * 0.38)
-    duration = float(segment["end"]) - float(segment["start"])
-    return (
-        _visual_len(_clean_display_text(segment.get("text") or "")) < min_chars
-        or duration < 0.95
-    )
-
-
-def _can_join(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    # Never join across a sentence boundary — a fragment glued to the wrong
-    # sentence reads worse than a short line.
-    left_text = (left.get("text") or "").rstrip()
-    if left_text and left_text[-1] in HARD_PUNCT:
-        return False
-    combined_len = _visual_len(_clean_display_text(left_text + (right.get("text") or "")))
-    combined_dur = float(right["end"]) - float(left["start"])
-    gap = float(right["start"]) - float(left["end"])
-    return combined_len <= MAX_SUBTITLE_CHARS and combined_dur <= MAX_SUBTITLE_SECONDS and gap <= 0.45
-
-
-def _join(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
-    return {
-        **left,
-        "text": (left.get("text") or "") + (right.get("text") or ""),
-        "end": right["end"],
-        "words": (left.get("words") or []) + (right.get("words") or []),
-    }
-
-
-def _merge_short_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Absorb fragments too short to read comfortably into a neighbor.
-    Backward merge first (into the previous line), forward merge as fallback
-    (a fragment that starts a new sentence belongs to the line after it).
-    Mirrors the burn-time merge thresholds so the preview matches the burn.
-    """
-    merged: list[dict[str, Any]] = []
-    for seg in segments:
-        if merged and _is_fragment(seg) and _can_join(merged[-1], seg):
-            merged[-1] = _join(merged[-1], seg)
-        else:
-            merged.append(dict(seg))
-
-    result: list[dict[str, Any]] = []
-    i = 0
-    while i < len(merged):
-        seg = merged[i]
-        if i + 1 < len(merged) and _is_fragment(seg) and _can_join(seg, merged[i + 1]):
-            result.append(_join(seg, merged[i + 1]))
-            i += 2
-        else:
-            result.append(seg)
-            i += 1
-    return result
-
-
-def _needs_split(segment: dict[str, Any]) -> bool:
-    text = segment.get("text") or ""
-    duration = float(segment.get("end", 0)) - float(segment.get("start", 0))
-    return (
-        _visual_len(_clean_display_text(text)) > MAX_SUBTITLE_CHARS
-        or duration > MAX_SUBTITLE_SECONDS
-    )
-
-
-def _llm_split_segment(segment: dict[str, Any], model: str) -> list[dict[str, Any]] | None:
-    """
-    Split ONE ASR sentence with LLM-chosen line breaks and re-time the lines
-    from the sentence's word timestamps. Returns None on any failure so the
-    caller can fall back to rule-based splitting for just this sentence.
-    """
-    words = segment.get("words") or []
-    if not words:
-        return None
-    lines = _llm_split_text(segment.get("text") or "", model=model)
-    if not lines:
-        return None
-    # One retry for a line the model left over-wide; a short line is a small
-    # input it splits reliably.
-    fixed: list[str] = []
-    for line in lines:
-        if _visual_len(_clean_display_text(line)) > MAX_SUBTITLE_CHARS:
-            sub = _llm_split_text(line, model=model)
-            if sub and len(sub) > 1:
-                fixed.extend(sub)
-                continue
-        fixed.append(line)
-    return _align_lines_to_words(fixed, words)
-
-
-def _llm_segment(segments: list[dict[str, Any]], model: str = SPLIT_LLM_MODEL) -> list[dict[str, Any]] | None:
-    """
-    Split over-long ASR sentences with LLM-chosen line breaks, sentence by
-    sentence, in parallel.
-
-    Per-sentence inputs keep the LLM reliable (echoing a whole transcript
-    makes it miscount widths and "fix" wording) and contain failures: one bad
-    response degrades one sentence to rule-based splitting instead of the
-    whole video. Sentences that already fit a subtitle line skip the LLM.
-    Phrase structure is the LLM's job; hard width/duration caps remain
-    mechanical (_shorten_segments) as the safety net.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    todo = [i for i, seg in enumerate(segments) if _needs_split(seg)]
-    if not todo:
-        return segments
-
-    results: dict[int, list[dict[str, Any]] | None] = {}
-    with ThreadPoolExecutor(max_workers=_SPLIT_WORKERS) as pool:
-        futures = {i: pool.submit(_llm_split_segment, segments[i], model) for i in todo}
-        for i, fut in futures.items():
-            try:
-                results[i] = fut.result()
-            except Exception:
-                results[i] = None
-
-    failed = sum(1 for i in todo if not results.get(i))
-    output: list[dict[str, Any]] = []
-    for i, seg in enumerate(segments):
-        split = results.get(i)
-        if split:
-            output.extend(split)
-        else:
-            output.append(seg)  # unchanged; _shorten_segments rule-splits it
-    log(f"LLM segmentation: {len(todo) - failed}/{len(todo)} long sentence(s) split"
-        + (f", {failed} fell back to rules" if failed else "") + ".")
-    return output
+def _rule_split_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep subtitle splitting deterministic and local when explicitly requested."""
+    return _shorten_segments(segments)
 
 
 def _convert_bailian_result(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -839,8 +597,7 @@ def transcribe_file(
     use_hotwords: bool = True,
     vocabulary_id: str | None = None,
     apply_glossary: bool = True,
-    split_mode: str = "llm",
-    split_model: str = SPLIT_LLM_MODEL,
+    split_mode: str = "raw",
 ) -> list[dict[str, Any]]:
     input_path = Path(input_path)
     if not input_path.exists():
@@ -891,19 +648,7 @@ def transcribe_file(
         # find fillers, false starts and repeated takes.
         segments = cleaned_segments
     else:
-        llm_segments = None
-        if split_mode == "llm":
-            log(f"Splitting subtitles with {split_model}...")
-            llm_segments = _llm_segment(cleaned_segments, model=split_model)
-            if llm_segments is None:
-                log("Falling back to rule-based subtitle splitting.")
-        base_segments = llm_segments if llm_segments else cleaned_segments
-        # _shorten_segments enforces the hard width/duration caps; on LLM output it
-        # only touches lines that exceed them. The merge pass then absorbs
-        # too-short fragments, mirroring the burn-time merge.
-        segments = _clean_segment_display_text(
-            _merge_short_segments(_shorten_segments(base_segments))
-        )
+        segments = _clean_segment_display_text(_rule_split_segments(cleaned_segments))
     glossary_hits = 0
     if apply_glossary:
         segments, glossary_hits = _apply_glossary(segments)
@@ -913,7 +658,7 @@ def transcribe_file(
     log(
         f"Transcribed {len(raw_segments)} ASR sentence(s), removed {removed_fillers} filler token(s), "
         f"applied glossary to {glossary_hits} segment(s), "
-        f"split into {len(segments)} subtitle segment(s), {sum(len(s.get('words', [])) for s in segments)} words."
+        f"returned {len(segments)} transcript segment(s), {sum(len(s.get('words', [])) for s in segments)} words."
     )
     return segments
 
@@ -938,12 +683,8 @@ def main():
                         help="Do not apply configured glossary corrections to the transcript text.")
     parser.add_argument("--glossary", default=None,
                         help="Glossary JSON path; overrides environment and user config.")
-    parser.add_argument("--split-mode", choices=["llm", "rules", "raw"], default="llm",
-                        help="Subtitle line splitting: 'llm' (default, phrase-aware via Qwen with "
-                             "rule fallback), 'rules' (token scoring only), or 'raw' "
-                             "(editing analysis with original ASR sentences).")
-    parser.add_argument("--split-model", default=SPLIT_LLM_MODEL,
-                        help=f"Chat model for LLM splitting (default: {SPLIT_LLM_MODEL}).")
+    parser.add_argument("--split-mode", choices=["rules", "raw"], default="raw",
+                        help="Subtitle line splitting: 'rules' or 'raw' (default; keeps original ASR sentences).")
     args = parser.parse_args()
 
     global HOTWORDS_PATH, GLOSSARY_PATH, VOCABULARY_CACHE_PATH
@@ -966,7 +707,6 @@ def main():
             vocabulary_id=args.vocabulary_id,
             apply_glossary=not args.no_glossary,
             split_mode=args.split_mode,
-            split_model=args.split_model,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

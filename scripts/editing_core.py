@@ -219,7 +219,7 @@ def protect_cuts_with_activity(
     cuts: list[dict[str, Any]],
     activity_intervals: list[tuple[float, float]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Reject whole automatic cuts that overlap a protected screen action."""
+    """Reject reviewed semantic cuts that overlap protected screen activity."""
     if not cuts or not activity_intervals:
         return cuts, []
     protected: list[dict[str, Any]] = []
@@ -235,6 +235,33 @@ def protect_cuts_with_activity(
         else:
             rejected.append({**cut, "activity_overlap_ms": overlap})
     return protected, rejected
+
+
+def annotate_activity_overlaps(
+    cuts: list[dict[str, Any]],
+    activity_intervals: list[tuple[float, float]],
+) -> list[dict[str, Any]]:
+    """Record screen activity that overlaps audio-derived pause cuts.
+
+    Audio-derived pause cuts are not blocked by this annotation. The report can
+    show the overlap for review while the single audio rule remains in charge
+    of automatic silence cleanup.
+    """
+    if not cuts or not activity_intervals:
+        return []
+    annotated: list[dict[str, Any]] = []
+    for cut in cuts:
+        overlap = next(
+            (
+                (start, end)
+                for start, end in activity_intervals
+                if end > cut["start_ms"] and start < cut["end_ms"]
+            ),
+            None,
+        )
+        if overlap is not None:
+            annotated.append({**cut, "activity_overlap_ms": overlap})
+    return annotated
 
 
 def protect_reviewed_cuts_with_activity(

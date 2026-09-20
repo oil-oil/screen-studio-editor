@@ -1,6 +1,6 @@
 # 剪辑诊断参考
 
-只在默认工作流出现漏检、误保留、缓存失效、坐标错误或需要模型对比时读取。
+只在默认工作流出现漏检、误保留、缓存失效或坐标错误时读取。默认质量链路只使用本地证据和 Agent 计划。
 
 ## 关键产物
 
@@ -9,12 +9,12 @@
 - `baseline-report.json`：本地 ASR、静音、VAD 和活动分析；
 - `baseline-report.transcript.edit.json`：源时间编辑转录稿；
 - `review-proxy/combined-timeline.mp4`：源时间对齐的音画代理；
-- `global-video-planner-v11.json`：全片候选；
-- `smart-edit-report.json`：偏好仲裁结果；
-- `smart-edit-cuts.json`：待应用 cuts；
+- `smart-edit-context.json`：当前 Agent 判断所需的全部证据和指纹；
+- `smart-edit-plan.json`：当前 Agent 的 keep/review/cut 决策；
+- `smart-edit-cuts.json`：经计划校验后的 source-time cuts；
 - `smart-edit-final-report.json`：最终 dry-run 审计。
 
-先从这些报告解释问题，再调整阈值或代码。
+先从这些报告解释问题，再调整阈值或代码。计划、cuts 和报告必须绑定同一个 `project_sha256`；context 改变后旧计划应拒绝执行。
 
 ## `process.py` 不变量
 
@@ -24,72 +24,73 @@
 - `--discard-external-edits` 会从备份重建，使用前必须告知用户；
 - 编辑转录稿保留 fillers、词级时间、标点和原始句界；
 - 确定性停顿删除不会覆盖 ASR 已识别词；
-- 点击、键盘输入和画面变化默认保护静默区间；
-- 多 session 的 ASR、静音和画面时间会重新锚定到统一源时间轴。
+- 默认连续无声超过 300ms 才进入自动剪辑候选，剪后保留约 180ms 气口；250ms 只是底层探测窗口；
+- 点击、键盘输入和画面变化会记录在无声候选报告中，但不会拦截音频规则；它们仍会保护 Agent 选中的语义删减；
+- 多 session 的 ASR、静音和画面时间会重新锚定到统一源时间轴；
+- Agent 选中的语义 cuts 仍会经过坐标、屏幕活动和最终 dry-run 校验。
 
 自动静音阈值按 session 估计。只有确认自动阈值误判时才固定 `--silence-db`：语音被裁时向 `-35` 降低，停顿残留时向 `-20` 提高。
 
-## 自定义 cuts
+## Agent 计划与自定义 cuts
 
-新 cuts 使用 schema v2：
+Agent 计划使用 `smart-edit-plan.json`，至少包含：
 
 ```json
 {
-  "schema_version": 2,
-  "coordinate_space": "source",
-  "project_sha256": null,
-  "cuts": [
+  "schema_version": 1,
+  "project_sha256": "来自 smart-edit-context.json",
+  "context_sha256": "来自 smart-edit-context.json",
+  "decisions": [
     {
+      "decision": "cut",
+      "confidence": "high",
       "start_ms": 123000,
       "end_ms": 131500,
-      "removed_text": "被删除的误讲",
-      "reason": "false_start",
-      "confidence": "high",
-      "kept_text": "后面的正确版本"
+      "category": "abandoned_take",
+      "removed_text": "被放弃的口播",
+      "kept_text": "后面的完整重说",
+      "reason": "后一遍明确覆盖前一遍",
+      "replacement_evidence": "U0020-U0024",
+      "screen_action": "redundant"
     }
   ]
 }
 ```
 
-从 `transcript.edit.json` 复制的时间使用 `source`。从导出视频取得的时间属于 `edited`，必须带当前工程指纹并通过切片映射，不能直接写成源时间。
+也可以用 `remove_start_id`、`remove_end_id` 引用 context 中的 `U0001` 等发言编号；脚本会把它们展开成 source 时间。只有 `decision=cut` 且置信度为 `high` 或 `medium` 的条目进入 cuts。`keep`、`review`、低置信度、非法时间和指纹不匹配都会被拒绝并记录。
 
-先 dry-run：
+最终的 `smart-edit-cuts.json` 使用 schema v2：
 
-```bash
-"$PYTHON" "$SKILL_DIR/scripts/process.py" \
-  --project "/path/to/Project.screenstudio" \
-  --skip-transcribe "/path/to/Project.screenstudio/transcript.edit.json" \
-  --cuts-file "/path/to/cuts.json" \
-  --pause-threshold 700 \
-  --min-pause 180 \
-  --pause-source silence \
-  --asr-backend bailian \
-  --language zh \
-  --dry-run
+```json
+{
+  "schema_version": 2,
+  "coordinate_space": "source",
+  "project_sha256": "当前 project.json 的 SHA-256",
+  "cuts": [{
+    "start_ms": 123000,
+    "end_ms": 131500,
+    "removed_text": "被删除的误讲",
+    "reason": "abandoned_take",
+    "confidence": "high"
+  }]
+}
 ```
 
-## 候选判断
+从 `transcript.edit.json` 复制的时间属于 `source`。从导出视频取得的时间属于 `edited`，必须带当前工程指纹并通过切片映射，不能直接写成 source 时间。
 
-默认流程由 AI 阅读全片转录、听声音并看画面提出语义候选，再由 AI 仲裁、执行 Agent 复核。模型对画面的描述可能不准确，争议删点需要查看实际画面。禁止用文本相似度、正则、固定词表或字数筛选替代语义判断，也不能通过这些规则擅自改动模型选定的范围。静音、词时间和输入活动属于测量证据，仍由程序处理。
+## 判断问题的顺序
 
-不要仅因重录超过固定时长、同组停顿多或候选类别名称不同，否决 AI 已指出替代关系的判断。复核时把切点前后连起来读，尤其检查主语、转折和条件：结巴句的开头也可能承载必要信息。
+当前 Agent 复核每条候选时，按这个顺序判断：
 
-高置信可删：
+1. 前后内容是不是同一件事，而不是恰好用了相似词；
+2. 后一遍是否明确覆盖前一遍的完整信息；
+3. 被删区间是否包含独有提醒、条件、数字、警告、结果或操作；
+4. 画面是否有点击、输入、状态变化、结果展示或被邀请阅读的内容；
+5. 删除后把前后两句连起来，主语、转折和句意是否完整。
 
-- 未完成的开头和紧接着的重说；
-- 明确自我纠正；
-- 完全重复的结尾；
-- 同一句重复录制，后一次明显更完整；
-- 不承载必要画面动作的重复解释。
+停顿不能单独证明重复；“嗯/啊/呃”只有在孤立且接缝自然时才删；文字相似、固定词表、正则或字数都不能替代语义判断。无法明确证明替代关系时保留或标记 `review`。
 
-必须保留：
-
-- 后一段增加条件、结果、故障排查或警告；
-- 相似措辞对应不同屏幕状态；
-- 重复段包含真实点击、命令、文件修改、生成结果或 UI 切换；
-- 模型无法指出明确替代关系的“可能重录”。
-
-需要画面证据时，仅抽取候选附近帧：
+需要画面证据时，查看对齐代理或仅抽取候选附近帧：
 
 ```bash
 mkdir -p /tmp/repeat_frames
@@ -99,18 +100,6 @@ ffmpeg -i "/path/to/video.mp4" -ss 42 -t 12 -vf "fps=1" \
 
 ## 缓存诊断
 
-正常重跑会复用现有分析。需要重做时使用质量入口的 `--force-analysis`，同步重做转录、音画代理、模型候选和最终分析。本次转录失败时停止语义剪辑，不使用遗留转录文件。
+正常重跑会复用本地分析。需要重做时使用质量入口的 `--force-analysis`，同步重做转录、音画代理、context 和最终分析。context 改变后必须重新写计划。本次转录失败时停止语义剪辑，不使用遗留转录文件。
 
-修改剪辑算法后，验证：AI 保留的相同措辞不会被规则删除；AI 确认的不同措辞重复能进入 cuts；重复句之间的独有提醒仍在成片中；已剪工程再次预览和应用的结果一致。使用临时工程和受控模型响应验证调用链，真实录屏的观感另行检查。
-
-## 模型比较
-
-用已剪工程的独立副本恢复完整录制时间线，运行真实模型，再与人工剪辑结果比较。人工切点只用于评分，不提供给模型，也不作为本次偏好样本。
-
-检查重复口播是否删净、独有信息和演示是否保留、接缝是否完整，并记录模型、耗时和调用量。时间区间的精确率、召回率和 F1 只衡量与人工切点的重合，不能直接称为语义准确率。需要多案例对比时再使用 `scripts/model_bakeoff.py`。
-
-受控响应的回归测试只证明流程正常；真实模型测试才能报告剪辑效果。单个视频的结果不能推导整体准确率。
-
-## 实验脚本
-
-`structured_edit_candidates.py`、`gemini_edit_candidates.py` 的规则候选入口，以及 `session_edit_planner.py`、`consensus_edit_candidates.py`、`candidate_recall_experiment.py` 不属于默认生产链路。旧规则仅供 benchmark 对照，不能把它们的候选或本地删除结论直接写入用户工程。
+验证时至少检查：Agent 选中的重复是否真的有替代、重复句之间的独有提醒是否保留、屏幕活动是否被保护、dry-run 和 apply 是否使用同一批 cuts。真实录屏的观感必须在 Screen Studio 中预览。

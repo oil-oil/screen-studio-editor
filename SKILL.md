@@ -4,18 +4,29 @@ description: >
   剪辑和整理 Screen Studio 的 .screenstudio 工程：删除停顿、误讲、重复录制和空片段，
   合并工程，或把口播工程的屏幕轨替换为按讲述对齐的 PPT。用户提供 .screenstudio 路径、
   要求清理录屏时间线、对照手工剪辑、合并补录或替换屏幕内容时使用。
-  不负责给导出的 MP4 烧录字幕；视频字幕使用 oil-subtitle。
+  不负责给导出的 MP4 烧录字幕；视频字幕使用 oil-subtitle。普通 MP4/MOV 粗剪使用 video-editor，
+  不要因为用户只提供导出视频或只要求加字幕而触发本 Skill。
 ---
 
 # Screen Studio Editor
 
-本 Skill 只负责 Screen Studio 工程时间线和工程内屏幕素材。导出成片后的字幕交给 `oil-subtitle`。
+本 Skill 只负责 Screen Studio 工程时间线和工程内屏幕素材。导出成片后的字幕交给
+`oil-subtitle`。
 
-AI 结合完整转录、声音和画面判断重复、口误、语气词及内容取舍。脚本负责静音检测、时间坐标、session 对齐、活动保护、波形切点和 `project.json` 写入。Agent 负责选择入口、审查结果并组织用户预览。
+质量剪辑分成两层：脚本先测量声音、转录时间、停顿和屏幕活动，当前 Agent 再根据完整上下文
+判断哪些有声音的内容真的应该删掉，脚本最后负责坐标校验、长无声清理、语义剪辑的屏幕活动保护和
+`project.json` 写入。确认没有人声的长空白由程序直接剪，不交给 Agent 做主观判断。
+质量判断不调用远程语义模型；当前 Agent 就是语义判断者。自动无声剪辑只依据音频证据，屏幕活动仅写入报告供复核；只有 Agent 选中的语义删减仍受屏幕活动保护。
 
-## API Key 配置入口
+## 转录配置
 
-云端转录与语义剪辑前，先读[API Key 配置与业务读取](references/api-key-setup.md)。质量剪辑使用 default 同页配置转录与分析 Key；仅转录使用 transcription。已有安全配置直接复用，缺少时由用户亲自填写固定页面，不在聊天或命令参数中传 Key。
+质量剪辑可能需要转录服务，但转录和语义判断是两件事：
+
+- `bailian`：使用百炼 FunAudio 做 ASR，只有音频会离开本机；
+- `local`：使用本机 Whisper/MLX Whisper，适合希望全程离线的情况；
+- 无论选哪种 ASR，重复、口误和内容取舍都由当前 Agent 判断，不需要额外的分析 Key。
+
+第一次配置或更换 ASR Key 时，阅读[API Key 配置与业务读取](references/api-key-setup.md)。已有安全配置直接复用，缺少时由用户亲自填写固定页面，不在聊天或命令参数中传 Key。
 
 ## 初始化
 
@@ -25,7 +36,7 @@ PYTHON="$SKILL_DIR/.venv/bin/python3"
 CONFIG="${SCREEN_STUDIO_EDITOR_CONFIG:-$HOME/.config/screen-studio-editor/config.json}"
 ```
 
-首次使用时运行：
+首次使用：
 
 ```bash
 bash "$SKILL_DIR/setup.sh"
@@ -39,10 +50,11 @@ bash "$SKILL_DIR/setup.sh"
   "creator_preferences": "/optional/path/to/creator-edit-preferences.json",
   "hotwords": "/optional/path/to/hotwords.json",
   "vocabulary_cache": "/optional/path/to/vocabulary-cache.json",
-  "model": "google/gemini-3.8-flash",
+  "asr_backend": "local",
   "smart_edit": {
-    "pause_threshold_ms": 700,
-    "min_pause_ms": 180
+    "pause_threshold_ms": 300,
+    "min_pause_ms": 180,
+    "asr_backend": "local"
   },
   "visual_defaults": {
     "enabled": false,
@@ -64,123 +76,134 @@ bash "$SKILL_DIR/setup.sh"
 }
 ```
 
-命令行参数优先于环境变量，环境变量优先于用户配置。质量剪辑必须配置 `model`，没有备用模型；直接运行底层模型脚本时显式传入 `--model`。不要提交用户配置、API Key、个人路径、偏好样本或 benchmark 数据。
-
-工程、合并结果、PPT 克隆和工程侧分析产物应放在 `projects_root`；未配置时放在源工程旁边。
-
 ## 模式 A：质量剪辑
 
 ### 1. 验证输入
 
-确认工程路径存在，并包含：
+确认工程目录存在，并包含：
 
 - `project.json`
 - `recording/`
 
 不要手工编辑 `project.json`，除非正在修复脚本无法处理的明确问题。
 
-### 2. 运行默认质量工作流
+### 2. 先准备本地证据
 
-普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
+普通口播和屏幕教程只运行这一条入口：
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio"
 ```
 
-该命令默认不写时间线。它内部完成基线 ASR、静音/VAD、屏幕活动分析、对齐代理、AI 全片候选、AI 音画仲裁和最终 dry-run，并复用仍然有效的缓存。执行 Agent 仍需复核语义删点和接缝；模型报告中的画面描述不能代替实际画面核对。
+这一步不写时间线。它会完成 ASR、静音/VAD、屏幕活动分析和源时间轴对齐，生成：
 
-个人偏好样本是可选的。已有独立 benchmark 工程时，可以构建 `creator_preferences`：
+- `smart-edit-context.json`：转录、稳定的 `U0001` 等发言编号、停顿和屏幕活动证据；
+- `review-proxy/combined-timeline.mp4`：供 Agent 在需要时核对声音和画面。
+
+如果希望只用本机 ASR：
 
 ```bash
-"$PYTHON" "$SKILL_DIR/scripts/preference_edit_arbiter.py" build \
-  --root "/path/to/benchmark-root" \
-  --output "/path/to/creator-edit-preferences.json"
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+  --project "/path/to/Project.screenstudio" \
+  --asr-backend local
 ```
 
-没有个人偏好样本时，AI 仍根据完整音画和上下文进行质量剪辑；不要套用别人的偏好，也不要用本次待测工程的已剪答案训练后再评分。
+### 3. 由当前 Agent 写语义计划
 
-模型对照测试使用相同材料和剪辑要求。用户未要求控制成本或时长时，不自行添加输出长度、思考预算或运行时长限制；记录服务端实际结束原因。截断、断连和格式失败单独报告，不能当成剪辑准确率。盲测不介入删点，人工版仅用于事后评分。
+读取 `smart-edit-context.json`，必要时查看 `review-proxy/combined-timeline.mp4`，再在工程内写入
+`smart-edit-plan.json`。计划必须原样带上 context 里的 `project_sha256` 和 `context_sha256`，所有时间都使用 source 时间轴。
 
+推荐格式：
 
-普通口播和屏幕教程只运行这一条入口，不要提前再跑一次 `process.py --dry-run`：
+```json
+{
+  "schema_version": 1,
+  "project_sha256": "从 context 复制",
+  "context_sha256": "从 context 复制",
+  "decisions": [
+    {
+      "decision": "cut",
+      "confidence": "high",
+      "start_ms": 1200,
+      "end_ms": 2380,
+      "category": "abandoned_take",
+      "removed_text": "被放弃的那一遍口播",
+      "kept_text": "后面留下的完整说法",
+      "reason": "前一遍明确重说，后一遍完整覆盖同一信息",
+      "replacement_evidence": "U0012-U0015",
+      "screen_action": "redundant",
+      "visual_assessment": "同一操作在后面的完整重录中再次出现"
+    },
+    {
+      "decision": "keep",
+      "confidence": "high",
+      "start_ms": 3000,
+      "end_ms": 4500,
+      "reason": "这里有独有提醒和演示"
+    }
+  ]
+}
+```
+
+规则分成两层：确认没有人声的空白，程序统一按 `pause_threshold_ms` 和 `min_pause_ms` 这套音频规则压掉；默认连续无声超过 300ms 才进入剪辑候选，并保留 180ms 气口。底层静音探测窗口是 250ms，只负责找候选，不能绕过 300ms 的最终门限。有声音但可能是重录、口误或孤立语气词时，才由 Agent 根据前后文判断。屏幕活动只作为报告中的证据，不再把无声区整段拦住。前一遍只有在后一遍明确重录并覆盖其信息时才删；不能因为文字相似就删除独有提醒、数字、警告、结果或操作。
+
+### 4. 生成并审查 dry-run
 
 ```bash
-node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio"
 ```
 
-该命令默认不写时间线。它内部完成基线 ASR、静音/VAD、屏幕活动分析、对齐代理、Gemini 全片候选、创作者偏好仲裁、本地微剪和最终 dry-run，并复用仍然有效的缓存。
+它会校验计划来源，生成 `smart-edit-cuts.json`，再运行最终 dry-run，写入 `smart-edit-final-report.json`。审查至少包括：
 
-### 3. 审查结果
-
-读取工程根目录下的 `smart-edit-final-report.json`，至少检查：
-
-- 每一条 smart cut 的删除文本、保留文本和理由；
-- 检查带有 `risk_flags` 标记的候选（如以“但是/不过/然而”等转折词开头的切点），连读确认切口连贯且未丢失独有信息；
+- 每条删除的原文、保留内容、理由和 source 时间；
 - 所有超过 5 秒的删除；
-- 屏幕有点击、键盘输入或持续变化的候选；
-- 原始时长、新时长和节省时间是否合理；
-- 是否出现模型拒绝、安全拦截或时间坐标错误。
+- 与点击、键盘输入、画面变化重叠的候选；
+- 以“但是/不过/然而”等转折词开头的切口；
+- 原始时长、新时长、被安全规则拦下的数量。
 
-语义候选和删除决策都由 AI 根据上下文及音画判断，不使用正则、固定词表、字数或文本相似度代替判断；“嗯”“啊”也可能表达确认，不能直接删除。文本匹配只用于核对 AI 指定的原文和时间位置。
-相同措辞可能承担不同作用，不同措辞也可能语义重复。重复句之间的独有提醒、结果和操作必须保留；脚本不能擅自扩大 AI 选中的删除范围。
-删除重录后，连读保留的前后两句，确认主语、转折和独有信息仍完整；不能因后面有更流畅的重录，就把前面的整段介绍一并删除。
+脚本只接受 `decision=cut` 且置信度为 `high` 或 `medium` 的计划条目；`keep`、`review`、低置信度和非法坐标都会被列入拒绝记录。自动停顿剪辑只由音频证据决定；屏幕活动会记录在 `pauses_with_activity_overlap` 中，供复核，但不会改变自动无声剪辑结果。
 
-### 4. 应用同一批已审查决策
+### 5. 应用同一批已审查决策
 
-确认安全后：
+确认 dry-run 安全后：
 
 ```bash
-node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run default -- "$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
+"$PYTHON" "$SKILL_DIR/scripts/smart_edit_workflow.py" \
   --project "/path/to/Project.screenstudio" \
   --apply
 ```
 
-`--apply` 直接使用已审查的 cuts 和本地分析，不再请求模型生成候选。如果需要废弃既有切片、从原始备份 `project.json.bak` 重新应用，可追加 `--discard-external-edits`。如果工程在审查后被 Screen Studio 修改或重新保存，先重新 dry-run，不能强行套用旧结果。
+`--apply` 只使用已有的 context、plan、cuts 和 final report，不再重新判断，也不访问任何模型服务。如果 Screen Studio 在审查后修改或重新保存工程，先重新准备证据和计划；不要套用旧结果。`--discard-external-edits` 只有在用户明确要求从 `project.json.bak` 重建时才可使用。
 
-### 5. 交付预览
+### 6. 交付预览
 
-报告停顿、重复、空片段、原始时长、新时长和节省时间。让用户在 Screen Studio 中预览工程；用户确认前不要继续处理导出视频。
+报告删除了多少停顿、重复和空片段，原始时长、新时长、节省时间以及被保留的风险候选。让用户在 Screen Studio 中预览工程；导出 MP4 后，需要字幕时切换到 `oil-subtitle`。
 
-用户导出 MP4 后，需要字幕时切换到 `oil-subtitle`。
+个人偏好样本是可选的。它们只能帮助 Agent 理解创作者已经确认过的取舍，不能替代当前工程的音画证据，也不能把本次待测工程的已剪答案当成训练材料。
 
 ## 模式 B：仅清理停顿
 
-只有用户明确不需要语义剪辑时使用。
-
-先 dry-run：
+只有用户明确不需要语义剪辑时使用。质量剪辑已准备过同一份证据时，可以复用 transcript；单独运行时先 dry-run：
 
 ```bash
 PROJECT="/path/to/Project.screenstudio"
 WORK="$PROJECT/.screen-studio-editor"
 mkdir -p "$WORK"
 
-node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PYTHON" "$SKILL_DIR/scripts/process.py" \
+"$PYTHON" "$SKILL_DIR/scripts/process.py" \
   --project "$PROJECT" \
-  --pause-threshold 700 \
+  --pause-threshold 300 \
   --min-pause 180 \
   --pause-source silence \
-  --asr-backend bailian \
+  --asr-backend local \
   --language zh \
   --dry-run \
   --report-output "$WORK/autoedit-report.json"
 ```
 
-审查报告后复用转录稿并应用：
-
-```bash
-node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PYTHON" "$SKILL_DIR/scripts/process.py" \
-  --project "$PROJECT" \
-  --skip-transcribe "$WORK/autoedit-report.transcript.edit.json" \
-  --pause-threshold 700 \
-  --min-pause 180 \
-  --pause-source silence \
-  --asr-backend bailian \
-  --language zh
-```
-
-不要关闭 VAD、画面扫描或屏幕活动保护，除非正在诊断具体错误。
+审查报告后再应用。不要关闭 VAD 或画面扫描，除非正在诊断具体错误；如果报告里出现 `pauses_with_activity_overlap`，先确认这些区间确实是无声，再按统一音频规则应用剪辑。
 
 ## 模式 C：合并工程
 
@@ -192,30 +215,11 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PY
   --supplement "/path/to/Supplement.screenstudio"
 ```
 
-插入指定 slice 后：
-
-```bash
-"$PYTHON" "$SKILL_DIR/scripts/merge_projects.py" \
-  --base "/path/to/Base.screenstudio" \
-  --supplement "/path/to/Supplement.screenstudio" \
-  --insert-after-slice 5
-```
-
-配置了 `projects_root` 时显式传入该目录下的 `--output`。输出已存在时脚本应停止；只有用户明确确认替换后才使用 `--force`。
+插入指定 slice 后追加 `--insert-after-slice 5`。输出已存在时脚本应停止；只有用户明确确认替换后才使用 `--force`。
 
 ## 模式 D：口播工程替换为 PPT 屏幕轨
 
-只用于“摄像头 + 麦克风口播，原屏幕是占位内容”的工程。先阅读 [工程格式说明](reference/screenstudio-project-format.md)。
-
-原则：
-
-- 永远在克隆工程上工作，原工程只读；
-- 按成片时间理解口播、设计页面和确定翻页点；
-- 页面需要真实产品或网站证据时再使用可用浏览工具，不能虚构界面；
-- 竖屏默认按 3:4 设计，大字少字，一页一个重点；
-- `plan.json` 使用成片时间的 `page_starts` 和可选 `zooms`。
-
-准备好渲染页和计划后：
+只用于“摄像头 + 麦克风口播，原屏幕是占位内容”的工程。永远在克隆工程上工作；按成片时间理解口播、设计页面和确定翻页点。准备好渲染页和计划后：
 
 ```bash
 "$PYTHON" "$SKILL_DIR/scripts/auto_ppt_replace.py" \
@@ -226,24 +230,18 @@ node "$SKILL_DIR/scripts/credential-ui/src/profile.ts" run transcription -- "$PY
 
 完成后让用户完全退出 Screen Studio，再打开克隆工程检查屏幕比例、翻页、淡入、鼠标隐藏和缩放。
 
-## 高级诊断
+## 高级诊断与安全边界
 
-仅在漏检、错误保护、自定义 cuts、缓存失效或模型对比时阅读 [剪辑诊断参考](reference/editing-diagnostics.md)。默认流程不要直接调用底层 planner、arbiter 或旧实验脚本。
+默认流程不要直接调用旧的候选生成或仲裁脚本。语义判断只从 context 进入 Agent 计划，再进入 cuts；不会绕过这条审查链。
 
-## 安全边界
-
-- `project.json` 的手工修改和用户在 Screen Studio 中的调整都属于用户数据。
-- 不得在未告知用户的情况下使用 `--discard-external-edits`。
-- 自定义 cuts 必须声明坐标空间；导出视频时间不能冒充源工程时间。
-- 全片模型只能提出候选，最终删除必须经过本地坐标、活动、边界和 dry-run 校验。
+- `project.json` 和用户在 Screen Studio 中的调整属于用户数据；
+- 自定义 cuts 必须声明坐标空间并绑定项目指纹；
+- 全部语义决定先进入可审查的 JSON 计划，脚本不能自己从词表、正则或文本相似度推断“应该删”；
+- 屏幕活动保护和最终 dry-run 是强制安全层；
 - PPT 替换只操作克隆工程。
+
+诊断说明见[剪辑诊断参考](reference/editing-diagnostics.md)，API 配置说明见[API Key 配置与业务读取](references/api-key-setup.md)。
 
 ## 报告格式
 
-保持简短：
-
-- 删除了多少停顿、重复和空片段；
-- 原始时长、新时长、节省时间；
-- 是否应用了视觉默认值；
-- 有哪些候选被安全规则保留；
-- 用户下一步应该预览什么。
+保持简短：删除了多少停顿、重复和空片段；原始时长、新时长、节省时间；语义决定来源为 `calling-agent`；有哪些候选被安全规则保留；用户下一步应该预览什么。

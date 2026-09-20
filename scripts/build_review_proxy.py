@@ -5,7 +5,7 @@ Screen Studio stores every pause/resume segment as a separate display and
 microphone file, while slice source times place the metadata durations
 back-to-back.  Raw media files can be slightly longer or shorter than those
 durations.  This script trims or pads every segment to its metadata duration
-before concatenation so a review model sees the same timeline as project.json.
+before concatenation so the reviewer sees the same timeline as project.json.
 """
 
 from __future__ import annotations
@@ -201,7 +201,7 @@ def build(project_dir: Path, *, width: int, height: int, fps: float, force: bool
             description="muxing the aligned multimodal review proxy",
         )
 
-        # 长视频内嵌请求容易在上传时断连；仅压缩给模型的代理，保留完整音轨和源时间。
+        # 代理只用于本地核对，压缩画面但保留完整音轨和源时间。
         # 显示代理仍保留较高帧率，供本地检查画面与剪点。
         if combined_path.stat().st_size > 16 * 1024 * 1024:
             compact_path = output_dir / "combined-timeline.compact.mp4"
