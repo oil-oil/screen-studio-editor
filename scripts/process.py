@@ -1049,6 +1049,9 @@ def measure_energy_percentiles(audio_path: Path) -> tuple[float | None, float | 
         return None, None
 
 
+_AUTO_SILENCE_FLOOR_DB = -30.5
+
+
 def resolve_silence_db(
     requested: str,
     mean_db: float | None,
@@ -1067,16 +1070,22 @@ def resolve_silence_db(
     if str(requested).strip().lower() == "auto":
         if noise_floor_db is not None and speech_level_db is not None and speech_level_db > noise_floor_db:
             derived = noise_floor_db + 0.45 * (speech_level_db - noise_floor_db)
-            derived = max(-45.0, min(-18.0, round(derived, 1)))
+            # A very low adaptive threshold can mistake a near-inaudible,
+            # otherwise empty slice for speech because a few isolated peaks
+            # raise the p80 value. Keep auto mode sensitive enough to catch
+            # those flat waveform blocks; explicit --silence-db values remain
+            # fully respected for recordings that need a different policy.
+            derived = max(_AUTO_SILENCE_FLOOR_DB, min(-18.0, round(derived, 1)))
             log(
                 f"🎚️  Adaptive silence threshold: {derived} dB "
-                f"(noise p20 {noise_floor_db:.1f}, speech p80 {speech_level_db:.1f} dBFS)."
+                f"(noise p20 {noise_floor_db:.1f}, speech p80 {speech_level_db:.1f} dBFS; "
+                f"auto floor {_AUTO_SILENCE_FLOOR_DB:.1f} dB)."
             )
             return derived
         if mean_db is None:
             log("⚠️  Could not measure audio level for --silence-db auto; falling back to -28 dB.")
             return -28.0
-        derived = max(-45.0, min(-18.0, round(mean_db - 10.0, 1)))
+        derived = max(_AUTO_SILENCE_FLOOR_DB, min(-18.0, round(mean_db - 10.0, 1)))
         log(f"🎚️  Adaptive silence threshold: {derived} dB (mean fallback {mean_db:.1f} dBFS − 10).")
         return derived
     return float(requested)
@@ -1394,15 +1403,18 @@ def remove_wordless_pause_slices(
     segments: list[dict],
     silence_regions: list[tuple[float, float]],
     activity_intervals: list[tuple[float, float]] | None = None,
-    max_duration_ms: float = 2500.0,
+    max_duration_ms: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Remove short wordless slices left behind by pause cuts.
+    Remove wordless slices that are demonstrably silent and inactive.
 
     Session-boundary snapping can preserve a smooth Screen Studio transition but
     leave a standalone silent slice after the boundary. These clips show up in the
     timeline as "Clip 2s/3s" blocks with no meaningful waveform. They are too long
-    for the old tiny-fragment filter, so clean them up explicitly.
+    for the old tiny-fragment filter, so clean them up explicitly. Duration is not
+    evidence that a slice contains useful content, so the production default does
+    not impose an arbitrary upper bound. Callers that need a narrower policy can
+    still pass ``max_duration_ms`` explicitly.
 
     "No words" is never sufficient evidence: a screen tutorial can contain an
     intentional click, wait, animation, or result with no narration.  Removal
@@ -1423,7 +1435,7 @@ def remove_wordless_pause_slices(
         end_ms = float(sl["sourceEndMs"])
         duration_ms = end_ms - start_ms
 
-        if duration_ms > max_duration_ms:
+        if max_duration_ms is not None and duration_ms > max_duration_ms:
             kept.append(sl)
             continue
 
@@ -1460,7 +1472,7 @@ def remove_wordless_pause_slices(
             kept.append(sl)
 
     if removed:
-        log(f"🧹 Removed {len(removed)} short wordless pause slice(s).")
+        log(f"🧹 Removed {len(removed)} wordless silent pause slice(s).")
         for r in removed:
             log(
                 f"   Drop slice {r['index']}: "

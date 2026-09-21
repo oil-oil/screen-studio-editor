@@ -140,6 +140,15 @@ class PauseSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(cuts[0]["duration_ms"], 320.0)
         self.assertAlmostEqual(cuts[0]["end_ms"] - cuts[0]["start_ms"], 140.0)
 
+    def test_auto_silence_threshold_has_audible_floor(self):
+        # A few isolated peaks must not make a nearly silent slice look like
+        # speech. Explicit thresholds remain caller-controlled.
+        self.assertEqual(
+            process.resolve_silence_db("auto", -26.1, -49.5, -25.9),
+            -30.5,
+        )
+        self.assertEqual(process.resolve_silence_db("-40", -26.1, -49.5, -25.9), -40.0)
+
     def test_audio_silence_overlap_with_asr_word_does_not_veto_cut(self):
         cuts = process.detect_pauses_from_silence(
             [(1.0, 1.4)],
@@ -209,10 +218,25 @@ class PauseSafetyTests(unittest.TestCase):
         self.assertEqual((result[0]["sourceStartMs"], result[0]["sourceEndMs"]), (0, 50))
 
     def test_wordless_slice_with_activity_is_kept(self):
-        slices = [{"id": "b", "sourceStartMs": 1000, "sourceEndMs": 3000}]
-        kept, removed = process.remove_wordless_pause_slices(slices, [], [(1.0, 3.0)], [(1500, 1600)])
+        slices = [{"id": "b", "sourceStartMs": 1000, "sourceEndMs": 4000}]
+        kept, removed = process.remove_wordless_pause_slices(slices, [], [(1.0, 4.0)], [(1500, 1600)])
         self.assertEqual([item["id"] for item in kept], ["b"])
         self.assertEqual(removed, [])
+
+    def test_three_second_wordless_silence_slice_is_removed(self):
+        slices = [
+            {"id": "before", "sourceStartMs": 0, "sourceEndMs": 1000},
+            {"id": "silent", "sourceStartMs": 1000, "sourceEndMs": 4000},
+            {"id": "after", "sourceStartMs": 4000, "sourceEndMs": 5000},
+        ]
+        kept, removed = process.remove_wordless_pause_slices(
+            slices,
+            [],
+            [(1.0, 4.0)],
+        )
+        self.assertEqual([item["id"] for item in kept], ["before", "after"])
+        self.assertEqual([item["index"] for item in removed], [1])
+        self.assertEqual(removed[0]["duration_ms"], 3000)
 
     def test_refine_repeat_cut_boundaries_keeps_complete_removed_word(self):
         with tempfile.TemporaryDirectory() as tmp:
